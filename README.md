@@ -1,7 +1,7 @@
 # Aurelia TUI
 
 A terminal UI for browsing, installing, updating, and launching your Steam
-library — powered by the [`aurelia`](https://crates.io/crates/aurelia)
+library — powered by the [`aurelia`](https://github.com/Drackrath/Aurelia)
 command-line Steam launcher.
 
 <p align="center">
@@ -24,7 +24,9 @@ heavy lifting — authentication, library listing, downloads, and launching
 
 ## Requirements
 
-- The [`aurelia`](https://github.com/Drackrath/Aurelia) CLI, **version `>= 0.1.40`**.
+- The [`aurelia`](https://github.com/Drackrath/Aurelia) CLI, **version `>= 0.1.40`**
+  (on Arch: the [`aurelia`](https://aur.archlinux.org/packages/aurelia) AUR
+  package; otherwise build it from source).
 - A Steam account (logging in is described below).
 
 Aurelia TUI looks for the `aurelia` binary in this order:
@@ -35,7 +37,8 @@ Aurelia TUI looks for the `aurelia` binary in this order:
 3. `aurelia` on your `PATH`.
 
 If none of these resolve, the sign-in screen tells you the binary couldn't be
-found.
+found. The detected `aurelia` version is shown in the bottom-right corner of the
+library footer, in the warning colour if it is older than 0.1.40 or missing.
 
 ## Building
 
@@ -45,8 +48,6 @@ It's a standard Rust project:
 cargo build --release
 ./target/release/aurelia-tui
 ```
-
-Nix users can build via the included `flake.nix`.
 
 ## Usage
 
@@ -76,10 +77,11 @@ sign-in screen to re-check the session.
 ### Browsing
 
 The library is a single live browser: **filter tabs** across the top
-(`All · Installed · Updates · Favourites`), the game list with **status badges**
-(`●` installed, `▲` update, `⬇` downloading, `○` not installed, `♡` favourite),
-a detail pane with cover art, and a **status bar** showing live counts, the
-active filter/sort, and your account. Press `?` any time for the full key list.
+(`All · Installed · Updates · Favourites`, plus a `Friends` tab), the game list
+with **status badges** (`●` installed, `▲` update, `⬇` downloading, `○` not
+installed, `♡` favourite), a detail pane with cover art, and a **status bar**
+showing live counts, the active filter/sort, your account, and the `aurelia`
+version. Press `?` any time for the full key list.
 
 #### Keys
 
@@ -88,19 +90,41 @@ active filter/sort, and your account. Press `?` any time for the full key list.
 | `j` / `↓`, `k` / `↑` | Move down / up (mouse wheel works too) |
 | `g` / `G` | Jump to top / bottom |
 | `PageUp` / `PageDown` | Page through the list |
-| `Tab` / `Shift-Tab` | Cycle filter tabs |
-| `1`–`4` | Jump straight to a tab |
+| `Tab` / `Shift-Tab` | Cycle tabs |
+| `1`–`5` | Jump straight to a tab (`5` = Friends) |
 | `/` | Focus the live fuzzy filter (type to narrow, `Esc` clears) |
 | `s` | Cycle sort (name / installed-first) |
-| `Enter` | Launch the selected game (`aurelia play`) |
+| `Enter` | Open the Actions menu for the selected game |
 | `i` | Expand / collapse the description panel |
-| `d` | Install / download the selected game |
-| `f` | Toggle the game as a favourite |
-| `H` | Hide the selected game |
+| `d` | Install / download (pick a library) |
+| `Space` / `c` | Pause / resume, or cancel, an install |
+| `U` / `v` / `x` | Update, verify, or uninstall |
+| `V` | Versions & pinning (downgrade to a manifest) |
+| `b` / `o` / `D` | Beta branches, depots, DLC |
+| `P` / `E` | Proton runtimes, runtime plugins (umu / luxtorpeda / Steam runtime) |
+| `C` / `W` / `a` / `I` | Cloud saves, Workshop, achievements, inventory |
+| `M` / `K` / `N` / `O` | Move, relink, import an install; collections |
+| `m` / `S` / `w` | Market listings, market search, wallet |
+| `R` | Running games |
+| `f` / `H` | Toggle favourite, hide the game |
+| `A` / `p` | Account, settings (presence, proxy) |
 | `r` | Refresh the library from Steam |
 | `l` | Sign in again |
 | `?` | Toggle the help overlay |
 | `q` | Quit |
+
+### The Actions menu
+
+`Enter` opens a filterable command palette with every action that applies to the
+selected game — type to narrow it, `Enter` to run. Two entries live only here:
+
+- **Play as…** lists every way the game can be started (`aurelia
+  launch-targets`): the native Linux build, or the Windows build with the in-Wine
+  Steam runtime, the host Steam client, or no Steam. Launching one applies to that
+  run only; unavailable targets say what's missing.
+- **Game settings** holds the per-game overrides: runner (auto / umu /
+  luxtorpeda), forced Proton, platform (auto / windows / linux), Steam runtime
+  (auto / on / off), Steam prefix (shared / per-game), and launch script.
 
 Selecting a game fetches its details lazily — developer/publisher metadata
 (`aurelia info`), the ProtonDB compatibility tier, and cover art all load in the
@@ -112,8 +136,8 @@ A little Easter egg for reading the documentation.
 
 ### Favourites
 
-`f` toggles a favourite (shown with a ♡), and `F` filters the list down to just
-your favourites.
+`f` toggles a favourite (shown with a ♡), and the Favourites tab (`4`) filters
+the list down to just your favourites.
 
 ### Hiding games
 
@@ -137,15 +161,11 @@ field in the config to include any of `Game`, `DLC`, `Driver`, `Application`,
 Launching, Proton/Wine, and runtime concerns are all handled by `aurelia play`,
 so there are no wrapper scripts or separate runtimes to manage on your side.
 
-## Missing features
-
-- Filter for only showing installed games.
-
 ## Credits
 
 - [steam-tui](https://github.com/dmadisetti/steam-tui) — the original client this
   is rebuilt from, by [@dmadisetti](https://github.com/dmadisetti) and contributors
-- [aurelia](https://crates.io/crates/aurelia) — the CLI backend
+- [aurelia](https://github.com/Drackrath/Aurelia) — the CLI backend
 - [steam-vent](https://codeberg.org/steam-vent/steam-vent) — Steam protocol implementation
 
 ## License
