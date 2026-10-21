@@ -609,3 +609,49 @@ fn workshop_comment_parses_aliases() {
     assert_eq!(anon.display_author(), "(anonymous)");
     assert_eq!(anon.message, "no name");
 }
+
+#[test]
+fn aurelia_version_minimum() {
+    use aurelia_tui::interface::aurelia::version_supported;
+    assert!(version_supported("0.1.40"));
+    assert!(version_supported("0.2.0"));
+    assert!(version_supported("v0.1.41-1"));
+    assert!(!version_supported("0.1.39"));
+    assert!(!version_supported("0.1.37-2"));
+    assert!(!version_supported("garbage"));
+}
+
+#[test]
+fn version_badge_sits_in_bottom_right_corner() {
+    isolate_config();
+    let browser = Browser::new(vec![game(1, "Alpha", true, false)]);
+    let render = |width: u16, version: Option<&str>| -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+        let area = Rect::new(0, 0, width, 2);
+        terminal
+            .draw(|f| {
+                f.render_widget(ui::status::status_bar(&browser, None), area);
+                f.render_widget(
+                    ui::status::version_badge(version),
+                    ui::status::version_badge_area(area, version),
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..2)
+            .map(|y| (0..width).map(|x| buf.get(x, y).symbol.clone()).collect())
+            .collect()
+    };
+
+    let rows = render(140, Some("0.1.40"));
+    assert!(rows[1].trim_end().ends_with("aurelia v0.1.40"), "badge is bottom-right");
+    assert!(rows[1].contains("[q] quit"), "key hints are not covered");
+
+    let rows = render(140, Some("0.1.18"));
+    assert!(rows[1].contains("needs >= 0.1.40"), "too-old version is flagged");
+
+    // Too narrow for both on the bottom row: the badge moves up, hints stay whole.
+    let rows = render(110, None);
+    assert!(rows[0].trim_end().ends_with("aurelia: not found"));
+    assert!(rows[1].contains("[q] quit"));
+}

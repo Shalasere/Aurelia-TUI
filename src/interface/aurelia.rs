@@ -56,6 +56,33 @@ pub fn bin() -> String {
     "aurelia".to_string()
 }
 
+/// The oldest `aurelia` release this TUI supports.
+pub const MIN_VERSION: (u32, u32, u32) = (0, 1, 40);
+
+/// The installed `aurelia` version (`aurelia --version` prints `aurelia 0.1.40`),
+/// or `None` when the binary can't be run.
+pub fn version() -> Option<String> {
+    let output = process::Command::new(bin())
+        .arg("--version")
+        .stdin(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().last().map(str::to_string)
+}
+
+/// Whether `version` (e.g. `0.1.40`, `0.1.37-2`) is at least [`MIN_VERSION`].
+/// An unparsable version counts as unsupported.
+pub fn version_supported(version: &str) -> bool {
+    let core = version.trim_start_matches('v').split('-').next().unwrap_or("");
+    let parts: Vec<u32> = core.split('.').filter_map(|p| p.parse().ok()).collect();
+    match parts.as_slice() {
+        [major, minor, patch] => (*major, *minor, *patch) >= MIN_VERSION,
+        _ => false,
+    }
+}
+
 /// Session health, from `aurelia login --health --json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthJson {

@@ -147,6 +147,9 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
     client.check_session()?;
     app.mode = Mode::Loading;
 
+    // Probed once: the binary doesn't change while the TUI runs.
+    let aurelia_version = aurelia::version();
+
     // Seed the browser from the cached library, if present.
     let mut cached = false;
     let mut browser = match client.games() {
@@ -326,6 +329,11 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                 frame.render_widget(
                     ui::status::status_bar(&browser, client.get_account().as_deref()),
                     chunks[2],
+                );
+                // Bottom-right corner, right of the key hints.
+                frame.render_widget(
+                    ui::status::version_badge(aurelia_version.as_deref()),
+                    ui::status::version_badge_area(chunks[2], aurelia_version.as_deref()),
                 );
 
                 // Achievements overlay floats above everything.
