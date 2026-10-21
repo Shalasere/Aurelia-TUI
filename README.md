@@ -24,7 +24,7 @@ heavy lifting — authentication, library listing, downloads, and launching
 
 ## Requirements
 
-- The [`aurelia`](https://github.com/Drackrath/Aurelia) CLI, **version `>= 0.1.11`**.
+- The [`aurelia`](https://github.com/Drackrath/Aurelia) CLI, **version `>= 0.1.40`**.
 - A Steam account (logging in is described below).
 
 Aurelia TUI looks for the `aurelia` binary in this order:

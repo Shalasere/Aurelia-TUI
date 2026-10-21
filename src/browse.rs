@@ -554,6 +554,16 @@ pub struct Browser {
     /// `proton_status` / `versions_busy`). Holds `"working…"` while running, then
     /// a terminal `"Done."`/`"Failed: …"` that [`Browser::poll_engine`] adopts.
     pub engine_busy: Arc<Mutex<Option<GameStatus>>>,
+
+    // --- Launch targets overlay ("Play as…") ---
+    /// Whether the launch-targets overlay is open.
+    pub show_launch_targets: bool,
+    /// The game's launch targets, from `aurelia launch-targets`.
+    pub launch_targets: Vec<aurelia::LaunchTargetJson>,
+    /// The highlighted target row.
+    pub launch_targets_index: usize,
+    /// A transient status line (fetch error, unavailable target).
+    pub launch_targets_status: String,
 }
 
 /// A single entry in the per-game Actions menu. Selecting one runs the same
@@ -562,6 +572,7 @@ pub struct Browser {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Play,
+    PlayAs,
     Install,
     PauseResume,
     CancelInstall,
@@ -759,6 +770,10 @@ impl Browser {
             engine_index: 0,
             engine_status: String::new(),
             engine_busy: Arc::new(Mutex::new(None)),
+            show_launch_targets: false,
+            launch_targets: Vec::new(),
+            launch_targets_index: 0,
+            launch_targets_status: String::new(),
         };
         browser.reset_selection();
         browser
@@ -2880,6 +2895,7 @@ impl Browser {
         }
         if installed {
             rows.push(ActionRow { action: Action::Play, category: PLAY, label: "Play", key: "" });
+            rows.push(ActionRow { action: Action::PlayAs, category: PLAY, label: "Play as… (launch target)", key: "" });
             rows.push(ActionRow { action: Action::Update, category: PLAY, label: "Update", key: "U" });
             rows.push(ActionRow { action: Action::Verify, category: PLAY, label: "Verify files", key: "v" });
             rows.push(ActionRow { action: Action::Uninstall, category: PLAY, label: "Uninstall", key: "x" });
@@ -3120,11 +3136,67 @@ impl Browser {
             .map(|s| s.state.clone())
     }
 
+    // --- Launch targets overlay ("Play as…") ---
+
+    /// Fetch the game's launch targets (`aurelia launch-targets`) and open the
+    /// overlay, highlighting the target plain `play` would pick.
+    pub fn open_launch_targets(&mut self, app_id: i32) {
+        self.launch_targets_status.clear();
+        self.launch_targets = match aurelia::launch_targets(app_id) {
+            Ok(targets) => targets,
+            Err(e) => {
+                self.launch_targets_status = format!("Failed: {e}");
+                Vec::new()
+            }
+        };
+        self.launch_targets_index = self
+            .launch_targets
+            .iter()
+            .position(|t| t.default)
+            .unwrap_or(0);
+        self.show_launch_targets = true;
+    }
+
+    pub fn close_launch_targets(&mut self) {
+        self.show_launch_targets = false;
+        self.launch_targets.clear();
+        self.launch_targets_index = 0;
+        self.launch_targets_status.clear();
+    }
+
+    pub fn launch_targets_next(&mut self) {
+        if !self.launch_targets.is_empty() {
+            self.launch_targets_index = (self.launch_targets_index + 1) % self.launch_targets.len();
+        }
+    }
+
+    pub fn launch_targets_previous(&mut self) {
+        if !self.launch_targets.is_empty() {
+            self.launch_targets_index = if self.launch_targets_index == 0 {
+                self.launch_targets.len() - 1
+            } else {
+                self.launch_targets_index - 1
+            };
+        }
+    }
+
+    /// The `play` options for the highlighted target, or `None` (with a status
+    /// explaining why) when it cannot be launched.
+    pub fn selected_launch_target(&mut self) -> Option<aurelia::PlayOpts> {
+        let target = self.launch_targets.get(self.launch_targets_index)?;
+        if !target.available {
+            let missing = target.missing.as_deref().unwrap_or("unknown");
+            self.launch_targets_status = format!("Unavailable (missing: {missing}).");
+            return None;
+        }
+        Some(target.play_opts())
+    }
+
     // --- Game settings overlay (per-game config overrides + launch script) ---
 
     /// Number of editable rows in the game-settings overlay: Runner, Forced
-    /// Proton, Platform, Launch script.
-    pub const GAME_CONFIG_ROWS: usize = 4;
+    /// Proton, Platform, Steam runtime, Steam prefix, Launch script.
+    pub const GAME_CONFIG_ROWS: usize = 6;
 
     /// Fetch the game's per-game config, launch-script state, and the installed
     /// Proton list (for cycling the forced runtime) and open the overlay.
@@ -3216,20 +3288,53 @@ impl Browser {
                     Err(e) => format!("Failed: {e}"),
                 };
             }
-            // Platform: toggle windows ↔ linux.
+            // Platform: auto → windows → linux → auto.
             2 => {
                 let cur = self
                     .game_config
                     .as_ref()
                     .and_then(|c| c.platform_preference.clone());
-                let next = match cur.as_deref() {
-                    Some("windows") => "linux",
-                    _ => "windows",
+                let (next, res) = match cur.as_deref() {
+                    None => ("windows", aurelia::config_game_set_platform(id, "windows")),
+                    Some("windows") => ("linux", aurelia::config_game_set_platform(id, "linux")),
+                    Some(_) => ("auto", aurelia::config_game_clear_platform(id)),
                 };
-                self.game_config_status = match aurelia::config_game_set_platform(id, next) {
+                self.game_config_status = match res {
                     Ok(()) => format!("Platform set to {next}."),
                     Err(e) => format!("Failed: {e}"),
                 };
+            }
+            // Steam runtime: auto → on → off → auto.
+            3 => {
+                let cur = self
+                    .game_config
+                    .as_ref()
+                    .and_then(|c| c.steam_runtime_policy.clone());
+                let next = match cur.as_deref() {
+                    Some("Enabled") => "off",
+                    Some("Disabled") => "auto",
+                    _ => "on",
+                };
+                self.game_config_status = match aurelia::config_game_set_steam_runtime(id, next) {
+                    Ok(()) => format!("Steam runtime set to {next}."),
+                    Err(e) => format!("Failed: {e}"),
+                };
+            }
+            // Steam prefix: toggle shared ↔ per-game.
+            4 => {
+                let cur = self
+                    .game_config
+                    .as_ref()
+                    .and_then(|c| c.steam_prefix_mode.clone());
+                let next = match cur.as_deref() {
+                    Some("PerGame") => "shared",
+                    _ => "per-game",
+                };
+                self.game_config_status =
+                    match aurelia::config_game_set_steam_prefix_mode(id, next) {
+                        Ok(()) => format!("Steam prefix set to {next}."),
+                        Err(e) => format!("Failed: {e}"),
+                    };
             }
             // Launch script: create one if none, else clear the per-game override.
             _ => {

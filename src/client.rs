@@ -58,6 +58,8 @@ pub enum Command {
     Update(i32, Arc<Mutex<Option<GameStatus>>>),
     /// Launch a game and wait for it to exit.
     Run(i32, Arc<Mutex<Option<GameStatus>>>),
+    /// Launch a game with extra `play` flags (e.g. a chosen launch target).
+    RunWith(i32, aurelia::PlayOpts, Arc<Mutex<Option<GameStatus>>>),
     /// Download and install a Proton/Wine runtime by name, streaming progress
     /// into the shared status cell.
     ProtonInstall(String, Arc<Mutex<Option<GameStatus>>>),
@@ -209,6 +211,9 @@ fn execute(
             }
             Command::Run(id, status) => {
                 thread::spawn(move || aurelia::play(id, status));
+            }
+            Command::RunWith(id, opts, status) => {
+                thread::spawn(move || aurelia::play_with(id, opts, status));
             }
             Command::ProtonInstall(name, status) => {
                 thread::spawn(move || aurelia::proton_install(name, status));
@@ -402,6 +407,13 @@ impl Client {
     pub fn run(&self, game: &Game) -> Result<(), STError> {
         let sender = self.sender.lock()?;
         sender.send(Command::Run(game.id, game.status_counter()))?;
+        Ok(())
+    }
+
+    /// Launches the provided game via `aurelia play` with extra flags.
+    pub fn run_with(&self, game: &Game, opts: aurelia::PlayOpts) -> Result<(), STError> {
+        let sender = self.sender.lock()?;
+        sender.send(Command::RunWith(game.id, opts, game.status_counter()))?;
         Ok(())
     }
 

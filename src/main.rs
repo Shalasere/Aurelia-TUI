@@ -451,6 +451,13 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                     frame.render_widget(ui::engine::engine(&browser), area);
                 }
 
+                // Launch targets ("Play as…") overlay floats above everything.
+                if browser.show_launch_targets {
+                    let area = ui::centered_rect(58, 40, frame.size());
+                    frame.render_widget(Clear, area);
+                    frame.render_widget(ui::launch_targets::launch_targets(&browser), area);
+                }
+
                 // "Not installed — install now?" prompt floats above the library.
                 if browser.confirm_install {
                     if let Some(game) = browser.selected() {
@@ -671,6 +678,9 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                                                     browser.confirm_install = true;
                                                 }
                                             }
+                                            Action::PlayAs => {
+                                                browser.open_launch_targets(game.id)
+                                            }
                                             Action::Install => {
                                                 if !browser.open_install_picker(game.id) {
                                                     let control =
@@ -784,6 +794,21 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('d') => browser.begin_downgrade_input(),
                                 _ => {}
                             }
+                        }
+                    } else if browser.show_launch_targets {
+                        match input {
+                            KeyCode::Esc | KeyCode::Char('q') => browser.close_launch_targets(),
+                            KeyCode::Down | KeyCode::Char('j') => browser.launch_targets_next(),
+                            KeyCode::Up | KeyCode::Char('k') => browser.launch_targets_previous(),
+                            KeyCode::Char('\n') | KeyCode::Enter => {
+                                if let Some(opts) = browser.selected_launch_target() {
+                                    browser.close_launch_targets();
+                                    if let Some(game) = browser.selected() {
+                                        client.run_with(&game, opts)?;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     } else if browser.show_game_config {
                         match input {
@@ -1725,7 +1750,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
         // Adopt a finished runtime-plugin worker (install/update/repair).
         browser.poll_engine();
 
-        if app.mode == Mode::Browse && !browser.show_help && !browser.show_dlc && !browser.show_account && !browser.show_config && !browser.show_achievements && !browser.show_cloud && !browser.show_branches && !browser.show_depots && !browser.show_chat && !browser.show_inventory && !browser.show_launch && !browser.show_market && !browser.show_market_search && !browser.show_move && !browser.show_relink && !browser.show_import && !browser.show_proton && !browser.show_running && !browser.show_wallet && !browser.show_workshop && !browser.show_friend_add && !browser.confirm_friend_remove && !browser.confirm_uninstall && !browser.show_install_picker && !browser.confirm_install && !browser.show_actions && !browser.show_versions && !browser.show_game_config && !browser.show_collections && !browser.show_engine {
+        if app.mode == Mode::Browse && !browser.show_help && !browser.show_dlc && !browser.show_account && !browser.show_config && !browser.show_achievements && !browser.show_cloud && !browser.show_branches && !browser.show_depots && !browser.show_chat && !browser.show_inventory && !browser.show_launch && !browser.show_market && !browser.show_market_search && !browser.show_move && !browser.show_relink && !browser.show_import && !browser.show_proton && !browser.show_running && !browser.show_wallet && !browser.show_workshop && !browser.show_friend_add && !browser.confirm_friend_remove && !browser.confirm_uninstall && !browser.show_install_picker && !browser.confirm_install && !browser.show_actions && !browser.show_versions && !browser.show_game_config && !browser.show_launch_targets && !browser.show_collections && !browser.show_engine {
             let selected = browser.selected();
             let cur_sel = selected.as_ref().map(|g| g.id);
             if cur_sel != artwork_sel_id {

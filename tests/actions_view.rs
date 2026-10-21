@@ -6,8 +6,8 @@
 
 use aurelia_tui::browse::{Action, Browser};
 use aurelia_tui::interface::aurelia::{
-    AvailableJson, CollectionJson, ConfigJson, DepotManifestInfo, GameConfigJson, LibraryGameJson,
-    PluginStatusJson, ProxyJson,
+    AvailableJson, CollectionJson, ConfigJson, DepotManifestInfo, GameConfigJson,
+    LaunchTargetJson, LibraryGameJson, PluginStatusJson, ProxyJson,
 };
 use aurelia_tui::interface::game::Game;
 use aurelia_tui::ui;
@@ -161,6 +161,8 @@ fn game_settings_overlay_renders_rows() {
         platform_preference: Some("windows".to_string()),
         runner: "umu".to_string(),
         launch_script: None,
+        steam_runtime_policy: Some("Enabled".to_string()),
+        steam_prefix_mode: Some("PerGame".to_string()),
     });
     let text = render(70, 12, |f| {
         f.render_widget(ui::game_config::game_config(&browser), Rect::new(0, 0, 70, 12));
@@ -169,6 +171,73 @@ fn game_settings_overlay_renders_rows() {
     assert!(text.contains("umu"), "current runner value renders");
     assert!(text.contains("GE-Proton9"), "forced proton value renders");
     assert!(text.contains("Platform"), "platform row renders");
+    assert!(text.contains("Steam runtime: on"), "steam runtime policy renders");
+    assert!(text.contains("Steam prefix: per-game"), "steam prefix mode renders");
+}
+
+#[test]
+fn launch_targets_parse_and_map_to_play_opts() {
+    let target: LaunchTargetJson = serde_json::from_value(serde_json::json!({
+        "id": "windows-host",
+        "platform": "windows",
+        "steam_mode": "host",
+        "available": true,
+        "default": false,
+        "missing": null,
+        "flags": ["--platform", "windows", "--steam-mode", "host"]
+    }))
+    .unwrap();
+    assert_eq!(target.label(), "Windows · host Steam");
+    let opts = target.play_opts();
+    assert_eq!(opts.platform.as_deref(), Some("windows"));
+    assert_eq!(opts.steam_mode.as_deref(), Some("host"));
+    assert!(!opts.steam);
+
+    let native: LaunchTargetJson = serde_json::from_value(serde_json::json!({
+        "platform": "linux",
+        "flags": ["--platform", "linux", "--steam"]
+    }))
+    .unwrap();
+    assert!(native.play_opts().steam, "native --steam flag carries over");
+}
+
+#[test]
+fn launch_targets_overlay_renders_targets() {
+    isolate_config();
+    let mut browser = Browser::new(vec![game(1, "Alpha", true)]);
+    browser.show_launch_targets = true;
+    browser.launch_targets = vec![
+        LaunchTargetJson {
+            id: "linux".to_string(),
+            platform: "linux".to_string(),
+            available: true,
+            default: true,
+            ..Default::default()
+        },
+        LaunchTargetJson {
+            id: "windows-runtime".to_string(),
+            platform: "windows".to_string(),
+            steam_mode: Some("runtime".to_string()),
+            missing: Some("build".to_string()),
+            ..Default::default()
+        },
+    ];
+    let text = render(70, 10, |f| {
+        f.render_widget(
+            ui::launch_targets::launch_targets(&browser),
+            Rect::new(0, 0, 70, 10),
+        );
+    });
+    assert!(text.contains("Linux (native)"), "native target renders");
+    assert!(text.contains("[default]"), "default target is tagged");
+    assert!(text.contains("missing: build"), "unavailable target says why");
+
+    // The unavailable target refuses to launch and says so.
+    browser.launch_targets_index = 1;
+    assert!(browser.selected_launch_target().is_none());
+    assert!(browser.launch_targets_status.contains("build"));
+    browser.launch_targets_index = 0;
+    assert!(browser.selected_launch_target().is_some());
 }
 
 #[test]

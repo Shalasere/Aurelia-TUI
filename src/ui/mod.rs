@@ -23,6 +23,7 @@ pub mod help;
 pub mod import;
 pub mod inventory;
 pub mod launch;
+pub mod launch_targets;
 pub mod list;
 pub mod market;
 pub mod market_search;

@@ -871,7 +871,7 @@ fn run_json_standalone(args: &[&str]) -> Result<serde_json::Value, STError> {
     }
 
     let value: serde_json::Value = serde_json::from_str(trimmed)?;
-    if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+    if let Some(err) = json_error(&value) {
         return Err(STError::Problem(err.to_string()));
     }
     Ok(value)
@@ -1142,6 +1142,17 @@ fn eta_suffix(eta_seconds: Option<u64>) -> String {
     format!(" · ETA {pretty}")
 }
 
+/// The error message of an `{"error": "...", "hint": "..."}` payload, if `value`
+/// is one. Since v0.1.37 the CLI may attach a `hint` (e.g. "run `aurelia login`")
+/// to typed errors; it is appended in parentheses.
+fn json_error(value: &serde_json::Value) -> Option<String> {
+    let err = value.get("error").and_then(|e| e.as_str())?;
+    match value.get("hint").and_then(|h| h.as_str()) {
+        Some(hint) if !hint.is_empty() => Some(format!("{err} ({hint})")),
+        _ => Some(err.to_string()),
+    }
+}
+
 /// Run `aurelia <args> --json`, returning the parsed stdout JSON value.
 ///
 /// Errors surface as `{"error": "..."}` on stdout; that is translated into an
@@ -1165,7 +1176,7 @@ fn run_json(args: &[&str]) -> Result<serde_json::Value, STError> {
     }
 
     let value: serde_json::Value = serde_json::from_str(trimmed)?;
-    if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+    if let Some(err) = json_error(&value) {
         return Err(STError::Problem(err.to_string()));
     }
     Ok(value)
@@ -1435,7 +1446,7 @@ pub fn chat_send(steamid: u64, message: &str) -> Result<(), STError> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+        if let Some(err) = json_error(&value) {
             return Err(STError::Problem(err.to_string()));
         }
     }
@@ -1767,7 +1778,7 @@ pub fn proton_install(name: String, status: Arc<Mutex<Option<GameStatus>>>) {
 
     match serde_json::from_str::<serde_json::Value>(result.trim()) {
         Ok(value) => {
-            if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            if let Some(err) = json_error(&value) {
                 set_status(&status, &format!("Failed: {}", err));
             } else {
                 set_status(&status, "Installed!");
@@ -1858,7 +1869,7 @@ pub fn login_qr(qr_cell: &Arc<Mutex<Option<String>>>) -> Result<(), STError> {
     })?;
     if value.get("logged_in").and_then(|b| b.as_bool()) == Some(true) {
         Ok(())
-    } else if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+    } else if let Some(err) = json_error(&value) {
         Err(STError::Problem(err.to_string()))
     } else {
         Err(STError::Problem("QR login did not complete".to_string()))
@@ -2147,7 +2158,7 @@ pub fn install(
 
     match serde_json::from_str::<serde_json::Value>(result.trim()) {
         Ok(value) => {
-            if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            if let Some(err) = json_error(&value) {
                 set_status(&status, &format!("Failed: {}", err));
             } else if value.get("status").and_then(|s| s.as_str()) == Some("installed") {
                 set_status(&status, "Installed!");
@@ -2250,7 +2261,7 @@ pub fn verify(id: i32, status: Arc<Mutex<Option<GameStatus>>>) {
 
     match serde_json::from_str::<serde_json::Value>(result.trim()) {
         Ok(value) => {
-            if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            if let Some(err) = json_error(&value) {
                 set_status(&status, &format!("Failed: {}", err));
             } else if value.get("status").and_then(|s| s.as_str()) == Some("verified") {
                 set_status(&status, "verified");
@@ -2322,7 +2333,7 @@ pub fn update(id: i32, status: Arc<Mutex<Option<GameStatus>>>) {
 
     match serde_json::from_str::<serde_json::Value>(result.trim()) {
         Ok(value) => {
-            if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            if let Some(err) = json_error(&value) {
                 set_status(&status, &format!("Failed: {}", err));
             } else if value.get("status").and_then(|s| s.as_str()) == Some("updated") {
                 set_status(&status, "updated");
@@ -2351,7 +2362,7 @@ pub fn play(id: i32, status: Arc<Mutex<Option<GameStatus>>>) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
                 Ok(value) => {
-                    if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+                    if let Some(err) = json_error(&value) {
                         set_status(&status, &format!("Failed: {}", err));
                     } else {
                         set_status(&status, "ran (finished)");
@@ -2551,6 +2562,12 @@ pub struct GameConfigJson {
     pub runner: String,
     #[serde(default)]
     pub launch_script: Option<String>,
+    /// Per-game Steam-runtime policy: `"Auto"`, `"Enabled"` or `"Disabled"`.
+    #[serde(default)]
+    pub steam_runtime_policy: Option<String>,
+    /// How the master Steam prefix backs this game: `"Shared"` or `"PerGame"`.
+    #[serde(default)]
+    pub steam_prefix_mode: Option<String>,
 }
 
 /// Extra launch flags for [`play_with`], mirroring `aurelia play`'s options.
@@ -2571,8 +2588,75 @@ pub struct PlayOpts {
     pub no_script: bool,
     /// Launch with real Steam integration (`--steam`).
     pub steam: bool,
-    /// Skip the pre-launch update check (`--noupdate`).
-    pub noupdate: bool,
+    /// Run this installed build, `"linux"` or `"windows"`, for this launch only
+    /// (`--platform <p>`, v0.1.40).
+    pub platform: Option<String>,
+    /// Steam integration for a Windows build, `"runtime"`, `"host"` or `"none"`,
+    /// for this launch only (`--steam-mode <m>`, v0.1.40).
+    pub steam_mode: Option<String>,
+    /// Skip the pre-launch update check (`--no-update`).
+    pub no_update: bool,
+}
+
+/// One way an installed game can be started, from `aurelia launch-targets <id>
+/// --json` (v0.1.40): a native Linux build, or the Windows build under one Steam
+/// mode. `flags` are the `play` flags selecting it; `missing` says what is
+/// needed when it is not `available` (e.g. `"build"`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LaunchTargetJson {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub steam_mode: Option<String>,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub missing: Option<String>,
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LaunchTargetsJson {
+    #[serde(default)]
+    targets: Vec<LaunchTargetJson>,
+}
+
+impl LaunchTargetJson {
+    /// A human label, e.g. `"Linux (native)"` or `"Windows · host Steam"`.
+    pub fn label(&self) -> String {
+        match (self.platform.as_str(), self.steam_mode.as_deref()) {
+            ("linux", _) => "Linux (native)".to_string(),
+            ("windows", Some("runtime")) => "Windows · Steam runtime (in Wine)".to_string(),
+            ("windows", Some("host")) => "Windows · host Steam".to_string(),
+            ("windows", Some("none")) => "Windows · standalone".to_string(),
+            (p, Some(m)) => format!("{p} · {m}"),
+            (p, None) => p.to_string(),
+        }
+    }
+
+    /// The [`PlayOpts`] that launch this target.
+    pub fn play_opts(&self) -> PlayOpts {
+        PlayOpts {
+            platform: Some(self.platform.clone()),
+            steam_mode: self.steam_mode.clone(),
+            // The native target's flags carry `--steam` when computed for it.
+            steam: self.flags.iter().any(|f| f == "--steam"),
+            ..PlayOpts::default()
+        }
+    }
+}
+
+/// List the ways an installed game can be launched (`aurelia launch-targets
+/// <id> --json`, v0.1.40).
+pub fn launch_targets(app_id: i32) -> Result<Vec<LaunchTargetJson>, STError> {
+    let value = run_json(&["launch-targets", &app_id.to_string()])?;
+    let parsed: LaunchTargetsJson = serde_json::from_value(value)?;
+    Ok(parsed.targets)
 }
 
 /// List each depot's current manifest id per branch (`aurelia manifests <id>
@@ -2715,7 +2799,7 @@ pub fn downgrade(
 
     match serde_json::from_str::<serde_json::Value>(result.trim()) {
         Ok(value) => {
-            if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            if let Some(err) = json_error(&value) {
                 set_status(&status, &format!("Failed: {}", err));
             } else if value.get("status").and_then(|s| s.as_str()) == Some("downgraded") {
                 set_status(&status, "downgraded");
@@ -3007,6 +3091,39 @@ pub fn config_game_set_platform(app_id: i32, platform: &str) -> Result<(), STErr
     Ok(())
 }
 
+/// Clear a game's platform preference, back to auto-detection
+/// (`aurelia config game <id> --no-platform --json`, v0.1.40).
+pub fn config_game_clear_platform(app_id: i32) -> Result<(), STError> {
+    run_json(&["config", "game", &app_id.to_string(), "--no-platform"])?;
+    Ok(())
+}
+
+/// Set a game's Steam-runtime policy, `"auto"`, `"on"` or `"off"`
+/// (`aurelia config game <id> --steam-runtime <p> --json`, v0.1.40).
+pub fn config_game_set_steam_runtime(app_id: i32, policy: &str) -> Result<(), STError> {
+    run_json(&[
+        "config",
+        "game",
+        &app_id.to_string(),
+        "--steam-runtime",
+        policy,
+    ])?;
+    Ok(())
+}
+
+/// Set how the master Steam prefix backs a game, `"shared"` or `"per-game"`
+/// (`aurelia config game <id> --steam-prefix-mode <m> --json`, v0.1.40).
+pub fn config_game_set_steam_prefix_mode(app_id: i32, mode: &str) -> Result<(), STError> {
+    run_json(&[
+        "config",
+        "game",
+        &app_id.to_string(),
+        "--steam-prefix-mode",
+        mode,
+    ])?;
+    Ok(())
+}
+
 /// Route a game through the luxtorpeda native-engine plugin, or clear that
 /// routing (`aurelia config game <id> --native-engine|--no-native-engine --json`).
 pub fn config_game_set_native_engine(app_id: i32, on: bool) -> Result<(), STError> {
@@ -3083,8 +3200,16 @@ pub fn play_with(id: i32, opts: PlayOpts, status: Arc<Mutex<Option<GameStatus>>>
     if opts.steam {
         args.push("--steam");
     }
-    if opts.noupdate {
-        args.push("--noupdate");
+    if let Some(p) = &opts.platform {
+        args.push("--platform");
+        args.push(p);
+    }
+    if let Some(m) = &opts.steam_mode {
+        args.push("--steam-mode");
+        args.push(m);
+    }
+    if opts.no_update {
+        args.push("--no-update");
     }
     args.push("--json");
 
@@ -3099,7 +3224,7 @@ pub fn play_with(id: i32, opts: PlayOpts, status: Arc<Mutex<Option<GameStatus>>>
             let stdout = String::from_utf8_lossy(&output.stdout);
             match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
                 Ok(value) => {
-                    if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+                    if let Some(err) = json_error(&value) {
                         set_status(&status, &format!("Failed: {}", err));
                     } else {
                         set_status(&status, "ran (finished)");
