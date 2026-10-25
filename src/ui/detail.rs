@@ -12,7 +12,7 @@ use crate::theme;
 use crate::util::stateful::Named;
 
 /// How many wrapped lines of the description to show while collapsed. Pressing
-/// `[i]` expands the row to the full text.
+/// `[i]` removes this cap; the available panel height still bounds the row.
 const DESC_COLLAPSED_LINES: usize = 6;
 
 /// Word-wrap `text` to `width` columns, preserving explicit newlines. Words
@@ -68,6 +68,9 @@ fn blank() -> Row<'static> {
 /// Build the detail content rows for `game` and their total height. Does *not*
 /// trigger the lazy metadata fetches — the caller does that only when the
 /// selection has settled (so scrolling doesn't fire a fetch per game).
+/// `None` measures the natural height for cover-art placement; `Some(height)`
+/// builds for the actual panel, limiting the description to its remaining rows.
+/// This is private bookkeeping: `detail` already receives the panel height.
 fn build_content(
     game: Option<&Game>,
     expand: bool,
@@ -124,6 +127,9 @@ fn build_content(
                 );
             }
 
+            // Keep times inside one wrapping table row, rather than adding a
+            // separate fixed row for each style, title, and source URL. The
+            // source remains accessible through the existing Actions menu.
             let hltb_lines = super::hltb::lines(&g.get_hltb(), width as usize);
             let hltb_height = hltb_lines.len() as u16;
             push(
@@ -161,6 +167,9 @@ fn build_content(
             // Description, listed as its own (wrapping) row.
             let description = g.get_description();
             if !description.is_empty() {
+                // Table fits whole rows: a six-line description that exceeds
+                // the remaining space can disappear entirely. Use the existing
+                // panel budget to show the lines that fit alongside HLTB.
                 let description_start = push(blank(), 1);
                 let mut lines = wrap(&description, width.max(1) as usize);
                 let available = height
@@ -225,7 +234,7 @@ pub fn content_height(game: Option<&Game>, expand: bool, width: u16) -> u16 {
 
 /// Build the detail table for the selected game (or an empty-state table). The
 /// description is listed as its own row; `expand` controls whether it is capped
-/// at [`DESC_COLLAPSED_LINES`] or shown in full, and `width` is the value
+/// at [`DESC_COLLAPSED_LINES`] or may use the remaining height; `width` is the value
 /// column width used to wrap it. `height` is the panel's inner height: the rows
 /// are bottom-aligned within it (padded from the top) so the cover art fills the
 /// empty space above the `ID | Name` head.

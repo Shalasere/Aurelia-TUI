@@ -140,6 +140,10 @@ impl Game {
             .unwrap_or_else(|| "-".to_string())
     }
 
+    /// Start one lookup after selection settles, like the store-info/Proton
+    /// paths. Cloned games share this slot, preventing duplicate work. If the
+    /// service is busy, leave Pending so only a still-selected game retries on
+    /// a later idle tick; do not queue every game the user scrolled past.
     pub fn query_hltb(&self) {
         let Ok(mut state) = self.hltb.lock() else {
             return;
@@ -163,6 +167,8 @@ impl Game {
         });
     }
 
+    /// Rendering reads only the shared snapshot; cache and network I/O stay on
+    /// the worker. Terminal states are retried by reloading the library (`r`).
     pub fn get_hltb(&self) -> HltbState {
         self.hltb
             .lock()

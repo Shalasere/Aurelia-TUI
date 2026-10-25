@@ -1,6 +1,8 @@
 //! Compact completion-time rows for the detail pane.
 use crate::interface::hltb::HltbState;
 
+/// Round to whole minutes without turning a real sub-minute time into "0m".
+/// HLTB uses zero for an unsubmitted style, which shares the missing-data marker.
 fn duration(seconds: Option<u64>) -> String {
     let Some(seconds) = seconds.filter(|s| *s > 0) else {
         return "—".into();
@@ -13,6 +15,9 @@ fn duration(seconds: Option<u64>) -> String {
     }
 }
 
+/// Pack complete play-style/time groups before wrapping individual words. The
+/// detail pane reserves one table row of this height, so keeping the groups
+/// compact leaves room for existing installation and description content.
 pub(super) fn lines(state: &HltbState, width: usize) -> Vec<String> {
     let text: &str = match state {
         HltbState::Ready { data, stale } => {
@@ -21,6 +26,8 @@ pub(super) fn lines(state: &HltbState, width: usize) -> Vec<String> {
                 format!("Main + Extras {}", duration(data.extra)),
                 format!("Completionist {}", duration(data.completionist)),
             ];
+            // Stale means refresh failed, not necessarily that the user is
+            // offline (a site-format change can fail just as well).
             if *stale {
                 parts.insert(0, "Cached".into());
             }
@@ -38,6 +45,8 @@ pub(super) fn lines(state: &HltbState, width: usize) -> Vec<String> {
                     if !line.is_empty() {
                         lines.push(std::mem::take(&mut line));
                     }
+                    // Only split a group if it cannot fit on an otherwise empty
+                    // line; ordinary wrapping could separate "10h" from "32m".
                     let mut wrapped = super::detail::wrap(&part, width.max(1));
                     line = wrapped.pop().unwrap_or_default();
                     lines.extend(wrapped);

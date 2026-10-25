@@ -110,6 +110,8 @@ fn only_one_background_worker_can_be_reserved_and_it_is_released() {
     assert!(reserve().is_some());
 }
 
+// A path prefix permits the init route's changing timestamp without weakening
+// checks on the method, route, request headers, or posted search payload.
 struct Step {
     method: &'static str,
     path: &'static str,
@@ -138,6 +140,8 @@ impl Step {
         self
     }
 }
+// Serve only the scripted exchanges on localhost. Finite accept/read budgets
+// make a missing request fail the test instead of hanging the test process.
 struct Server {
     base: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -187,6 +191,8 @@ impl Server {
                         break (end + 4, length);
                     }
                 };
+                // TCP may split headers and JSON across separate reads. Do not
+                // assert the search payload until Content-Length bytes arrived.
                 while raw.len() < header_end + length {
                     let mut buffer = [0u8; 4096];
                     let count = socket.read(&mut buffer).unwrap();
@@ -215,6 +221,8 @@ impl Server {
             worker,
         }
     }
+    // Joining also surfaces assertion failures from the server thread; otherwise
+    // an incorrectly ordered or missing request could leave a false-green test.
     fn finish(self) -> Vec<String> {
         self.worker.join().unwrap();
         Arc::try_unwrap(self.requests)
