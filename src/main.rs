@@ -176,6 +176,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
         // Adopt any async friend-management results (resolved search previews and
         // roster refreshes after an add/remove) before drawing this frame.
         browser.poll_friends_ops();
+        browser.poll_hltb();
 
         // Drain any finished off-thread Workshop browse/search/subscribe worker
         // before rendering, so its result lands on the next frame. Runs on every
@@ -744,6 +745,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                                             Action::Achievements => browser.open_achievements(),
                                             Action::Depots => browser.open_depots(game.id),
                                             Action::Inventory => browser.open_inventory(game.id),
+                                            Action::Hltb => browser.open_hltb(),
                                             Action::Move => {
                                                 if game.installed {
                                                     browser.open_move(game.id);
@@ -1399,6 +1401,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             KeyCode::Char('i') => browser.toggle_description(),
+                            KeyCode::Char('t') => browser.open_hltb(),
                             KeyCode::Down | KeyCode::Char('j') => browser.next(),
                             KeyCode::Up | KeyCode::Char('k') => browser.previous(),
                             KeyCode::Char('g') => browser.home(),
@@ -1796,6 +1799,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(g) = selected.as_ref() {
                     g.query_proton();
                     g.query_info();
+                    g.query_hltb();
                 }
             }
         }

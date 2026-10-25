@@ -96,6 +96,7 @@ version. Press `?` any time for the full key list.
 | `s` | Cycle sort (name / installed-first) |
 | `Enter` | Open the Actions menu for the selected game |
 | `i` | Expand / collapse the description panel |
+| `t` | Open the selected game’s HowLongToBeat page |
 | `d` | Install / download (pick a library) |
 | `Space` / `c` | Pause / resume, or cancel, an install |
 | `U` / `v` / `x` | Update, verify, or uninstall |
@@ -130,6 +131,13 @@ Selecting a game fetches its details lazily — developer/publisher metadata
 (`aurelia info`), the ProtonDB compatibility tier, and cover art all load in the
 background, so navigation stays responsive while they fill in.
 
+HowLongToBeat completion times also load after selection settles. The detail
+pane shows Main Story, Main + Extras, and Completionist times; `—` means no
+submitted time for that style. Press `t` (or choose **HowLongToBeat page** in
+Actions) to open the verified match. `Cached` marks an older result retained
+after a failed refresh. See [HowLongToBeat](docs/HOWLONGTOBEAT.md) for matching,
+cache, and troubleshooting details.
+
 ## Features not in the help
 
 A little Easter egg for reading the documentation.
@@ -156,6 +164,7 @@ field in the config to include any of `Game`, `DLC`, `Driver`, `Application`,
 | --- | --- | --- |
 | `~/.config/aurelia-tui/` | `config.json` (favourites, hidden games, allowed types, highlight colour) | `AURELIA_TUI_DIR` |
 | `~/.cache/aurelia-tui/` | cached library (`games.json`) | `AURELIA_TUI_CACHE_DIR` |
+| `~/.cache/aurelia-tui/hltb/` | cached HowLongToBeat matches and completion times | `AURELIA_TUI_CACHE_DIR` (parent directory) |
 | `~/.cache/aurelia-tui/icons/` | cached cover art | `AURELIA_TUI_ICON_DIR` |
 
 Launching, Proton/Wine, and runtime concerns are all handled by `aurelia play`,

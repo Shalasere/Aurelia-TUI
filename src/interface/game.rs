@@ -1,11 +1,12 @@
 use std::thread;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::interface::aurelia::{self, InfoJson, LibraryGameJson};
 use crate::interface::game_status::GameStatus;
+use crate::interface::hltb::{self, HltbState};
 use crate::interface::proton_data;
 use crate::util::{error::STError, stateful::Named};
 
@@ -55,6 +56,8 @@ pub struct Game {
 
     #[serde(skip)]
     proton_tier: Arc<Mutex<Option<String>>>,
+    #[serde(skip)]
+    hltb: Arc<Mutex<HltbState>>,
     // Lazily-fetched store metadata (developer/publisher/description) from
     // `aurelia info`. `info_requested` guards against re-spawning the fetch.
     #[serde(skip)]
@@ -97,6 +100,7 @@ impl Game {
             update_available: entry.update_available,
             size: 0.0,
             proton_tier: Arc::new(Mutex::new(None)),
+            hltb: Arc::new(Mutex::new(HltbState::Pending)),
             info: Arc::new(Mutex::new(None)),
             info_requested: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(None)),
@@ -134,6 +138,36 @@ impl Game {
             .ok()
             .and_then(|status| status.clone())
             .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn query_hltb(&self) {
+        let Ok(mut state) = self.hltb.lock() else {
+            return;
+        };
+        if !matches!(*state, HltbState::Pending) {
+            return;
+        }
+        let Some(permit) = hltb::reserve() else {
+            return;
+        };
+        *state = HltbState::Loading;
+        let reference = self.hltb.clone();
+        let id = self.id;
+        let name = self.name.clone();
+        thread::spawn(move || {
+            let _permit = permit;
+            let result = hltb::lookup(id, &name);
+            if let Ok(mut state) = reference.lock() {
+                *state = result;
+            }
+        });
+    }
+
+    pub fn get_hltb(&self) -> HltbState {
+        self.hltb
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| HltbState::Unavailable("HLTB state unavailable".into()))
     }
 
     /// Lazily fetch store metadata (developer/publisher/description) the first
@@ -255,5 +289,108 @@ impl Named for Game {
     fn is_valid(&self) -> bool {
         let config = Config::cached();
         !&config.hidden_games.contains(&self.id) && config.allowed_games.contains(&self.game_type)
+    }
+}
+
+#[cfg(test)]
+mod hltb_tests {
+    use super::*;
+    use crate::interface::hltb::HltbData;
+    use tui::{Terminal, backend::TestBackend};
+
+    fn portal() -> Game {
+        Game::from_library(LibraryGameJson {
+            app_id: 400,
+            name: "Portal".into(),
+            is_installed: true,
+            install_path: Some("/games/Portal".into()),
+            update_available: false,
+            is_owned: true,
+            is_family_shared: false,
+            platform: None,
+            active_branch: None,
+            assets: None,
+            store_url: Some("https://store.steampowered.com/app/400".into()),
+        })
+    }
+
+    #[test]
+    fn cached_games_restore_pending_state_and_clones_share_live_results() {
+        let game = portal();
+        let restored: Game = serde_json::from_str(&serde_json::to_string(&game).unwrap()).unwrap();
+        assert!(matches!(restored.get_hltb(), HltbState::Pending));
+        let clone = game.clone();
+        *clone.hltb.lock().unwrap() = HltbState::Unavailable("HTTP 429".into());
+        assert!(matches!(game.get_hltb(), HltbState::Unavailable(e) if e == "HTTP 429"));
+        game.query_hltb();
+        assert!(
+            matches!(game.get_hltb(), HltbState::Unavailable(_)),
+            "failed lookups do not retry every frame"
+        );
+    }
+
+    #[test]
+    fn populated_detail_panes_keep_times_installation_and_description_visible() {
+        let game = portal();
+        *game.info.lock().unwrap() = Some(InfoJson {
+            app_id: 400,
+            name: "Portal".into(),
+            developers: vec!["Valve".into()],
+            publishers: vec!["Valve".into()],
+            description: "Aperture Science offers puzzles. ".repeat(40),
+            ..Default::default()
+        });
+        let data = HltbData {
+            game_id: 7230,
+            game_name: "Portal".into(),
+            main: Some(11230),
+            extra: Some(18943),
+            completionist: Some(37927),
+        };
+        for stale in [false, true] {
+            *game.hltb.lock().unwrap() = HltbState::Ready {
+                data: data.clone(),
+                stale,
+            };
+            for (width, height) in [(44, 20), (80, 24), (100, 36)] {
+                let value_width = (width - 2) * 82 / 100 - 1;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| {
+                        f.render_widget(
+                            crate::ui::detail::detail(Some(&game), false, value_width, height - 2),
+                            f.size(),
+                        )
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = (0..height)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer.get(x, y).symbol.clone())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for expected in [
+                    "HLTB",
+                    "3h 7m",
+                    "5h 16m",
+                    "10h 32m",
+                    "Valve",
+                    "/games/Portal",
+                    "Aperture",
+                    "…",
+                ] {
+                    assert!(
+                        text.contains(expected),
+                        "{width}x{height} (stale={stale}) missing {expected}:\n{text}"
+                    );
+                }
+                if stale {
+                    assert!(text.contains("Cached"));
+                }
+            }
+        }
     }
 }

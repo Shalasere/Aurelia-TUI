@@ -470,6 +470,8 @@ pub struct Browser {
     /// status bar until the next keypress. Keeps a failed backend call from
     /// having to crash the whole TUI to report itself.
     pub notice: Option<String>,
+    /// Browser-launch results arrive off-thread so opening a page cannot stall input.
+    hltb_open_pending: Arc<Mutex<Option<Result<(), String>>>>,
 
     // --- Actions menu (per-game command palette) ---
     /// Whether the per-game Actions menu is open. This is the primary way to
@@ -591,6 +593,7 @@ pub enum Action {
     Achievements,
     Depots,
     Inventory,
+    Hltb,
     Move,
     Relink,
     Import,
@@ -738,6 +741,7 @@ impl Browser {
             install_picker_index: 0,
             game_refresh_slot: Arc::new(Mutex::new(Vec::new())),
             notice: None,
+            hltb_open_pending: Arc::new(Mutex::new(None)),
             show_actions: false,
             actions_index: 0,
             actions_filter: String::new(),
@@ -2874,6 +2878,40 @@ impl Browser {
         self.reset_selection();
     }
 
+    /// Shared by the Actions menu and `t`; only a verified HLTB page is opened.
+    pub fn open_hltb(&mut self) {
+        use crate::interface::hltb::HltbState;
+        let Some(game) = self.selected() else {
+            return;
+        };
+        match game.get_hltb() {
+            HltbState::Ready { data, .. } => {
+                let pending = self.hltb_open_pending.clone();
+                thread::spawn(move || {
+                    let result = crate::util::browser::open(&data.url()).map_err(|e| e.to_string());
+                    if let Ok(mut slot) = pending.lock() {
+                        *slot = Some(result);
+                    }
+                });
+            }
+            HltbState::Unavailable(error) => {
+                self.notice = Some(format!("HLTB: {error}. Press r to retry."))
+            }
+            HltbState::NotFound => self.notice = Some("HLTB: no verified Steam match".into()),
+            HltbState::Pending | HltbState::Loading => {
+                self.notice = Some("HLTB: waiting for game details".into())
+            }
+        }
+    }
+
+    pub fn poll_hltb(&mut self) {
+        if let Ok(mut slot) = self.hltb_open_pending.lock()
+            && let Some(Err(error)) = slot.take()
+        {
+            self.notice = Some(format!("HLTB: {error}"));
+        }
+    }
+
     // --- Actions menu (per-game command palette) ---
 
     /// The full set of actions applicable to the currently selected game, before
@@ -2914,6 +2952,7 @@ impl Browser {
         rows.push(ActionRow { action: Action::LaunchOptions, category: RT, label: "Launch options", key: "L" });
 
         const CONTENT: &str = "Content";
+        rows.push(ActionRow { action: Action::Hltb, category: CONTENT, label: "HowLongToBeat page", key: "t" });
         rows.push(ActionRow { action: Action::Dlc, category: CONTENT, label: "DLC", key: "D" });
         rows.push(ActionRow { action: Action::Workshop, category: CONTENT, label: "Workshop", key: "W" });
         rows.push(ActionRow { action: Action::Cloud, category: CONTENT, label: "Cloud saves", key: "C" });
