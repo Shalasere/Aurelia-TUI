@@ -47,7 +47,7 @@ pub fn config(browser: &Browser) -> Table<'static> {
     // Local preferences must remain visible without a working launcher. Keep
     // the switch first so it is also reachable in shorter settings panels.
     let mut rows = vec![row(
-        "HowLongToBeat [h]",
+        "HowLongToBeat",
         yes_no(Config::cached().hltb_enabled),
     )];
     rows.extend(match &browser.config_info {

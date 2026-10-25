@@ -117,7 +117,7 @@ else:
                 # Local settings must work even though the fake launcher fails
                 # config reads. While editing a proxy, h remains ordinary text.
                 os.write(terminal, b"p")
-                read_until(lambda text: b"HowLongToBeat[h]" in text and b"Launchersettingsunavailable" in text)
+                read_until(lambda text: b"HowLongToBeat" in text and b"Launchersettingsunavailable" in text)
                 os.write(terminal, b"eh")
                 read_until(lambda text: b"h_" in text)
                 assert config_data().get("hltb_enabled") is True

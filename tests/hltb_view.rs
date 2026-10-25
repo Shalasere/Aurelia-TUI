@@ -128,7 +128,8 @@ fn hltb_switch_preserves_config_and_controls_queries_rendering_and_actions() {
         .draw(|f| f.render_widget(ui::config::config(&browser), f.size()))
         .unwrap();
     let settings = text(&terminal);
-    assert!(settings.contains("HowLongToBeat [h]"));
+    assert!(settings.contains("HowLongToBeat"));
+    assert!(!settings.contains("HowLongToBeat [h]"));
     assert!(settings.contains("off"));
     assert!(settings.contains("Launcher"));
     assert!(settings.contains("Unavailable"));
