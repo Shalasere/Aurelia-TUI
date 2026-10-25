@@ -1299,7 +1299,7 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                     } else if browser.show_config {
                         // Settings overlay. While editing the proxy URL, keys edit
                         // that input; otherwise dismiss / toggle presence / edit or
-                        // clear the proxy in place.
+                        // clear the proxy, or toggle TUI-owned HLTB lookups in place.
                         if browser.config_proxy_input.is_some() {
                             match input {
                                 KeyCode::Esc => browser.cancel_proxy_edit(),
@@ -1323,6 +1323,18 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                                         .unwrap_or(false);
                                     let _ = aurelia::set_presence(!online);
                                     let _ = browser.open_config();
+                                }
+                                KeyCode::Char('h') => {
+                                    // Keep the live copy and persisted/cache copy in
+                                    // sync; a failed save leaves the old preference.
+                                    let mut updated = config.clone();
+                                    updated.hltb_enabled = !updated.hltb_enabled;
+                                    match updated.save() {
+                                        Ok(()) => config = updated,
+                                        Err(error) => {
+                                            browser.notice = Some(format!("HLTB setting: {error}"));
+                                        }
+                                    }
                                 }
                                 KeyCode::Char('e') => browser.begin_proxy_edit(),
                                 KeyCode::Char('c') => browser.clear_proxy(),
@@ -1799,7 +1811,9 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(g) = selected.as_ref() {
                     g.query_proton();
                     g.query_info();
-                    g.query_hltb();
+                    if config.hltb_enabled {
+                        g.query_hltb();
+                    }
                 }
             }
         }

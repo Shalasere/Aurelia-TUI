@@ -145,6 +145,11 @@ impl Game {
     /// service is busy, leave Pending so only a still-selected game retries on
     /// a later idle tick; do not queue every game the user scrolled past.
     pub fn query_hltb(&self) {
+        // Guard here as well as in the idle dispatcher so callers cannot start
+        // HLTB work while disabled, even when a cached result already exists.
+        if !Config::cached().hltb_enabled {
+            return;
+        }
         let Ok(mut state) = self.hltb.lock() else {
             return;
         };
@@ -160,7 +165,13 @@ impl Game {
         let name = self.name.clone();
         thread::spawn(move || {
             let _permit = permit;
-            let result = hltb::lookup(id, &name);
+            // A toggle can change after scheduling but before this thread runs.
+            // Leave the game retryable if it was disabled in that interval.
+            let result = if Config::cached().hltb_enabled {
+                hltb::lookup(id, &name)
+            } else {
+                HltbState::Pending
+            };
             if let Ok(mut state) = reference.lock() {
                 *state = result;
             }

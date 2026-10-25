@@ -100,6 +100,7 @@ fn entries() -> Vec<Entry> {
         Entry::Binding("r", "refresh library"),
         Entry::Binding("A", "account"),
         Entry::Binding("p", "settings"),
+        Entry::Binding("p then h", "toggle HowLongToBeat"),
         Entry::Binding("F / 5", "open Friends tab"),
         Entry::Binding("c / Enter", "chat (Friends tab)"),
         Entry::Binding("t", "chat in new window"),

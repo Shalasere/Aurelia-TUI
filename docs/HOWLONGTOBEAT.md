@@ -10,6 +10,29 @@ your platform's default browser. The full URL is available through this action
 rather than taking another row in the detail pane. On Linux this requires
 `xdg-open`; macOS uses `open`, and Windows uses `start`.
 
+## Enabling and disabling
+
+Press `p` to open Settings, then `h` to toggle **HowLongToBeat**. The switch is
+on by default, including for older config files that do not yet have this
+field. Its value is saved as `hltb_enabled` in
+`~/.config/aurelia-tui/config.json` (or under `AURELIA_TUI_DIR`). You can also
+edit that field while the TUI is closed.
+
+The switch uses the existing settings overlay, like other third-party
+integration settings such as Luxtorpeda. HLTB's preference is owned by the TUI,
+while runtime-plugin settings are owned by the separate Aurelia launcher.
+The local switch remains accessible if reading launcher settings fails.
+
+When off, no new HLTB lookup is scheduled, its detail content and Actions menu
+entry are hidden, and `t` displays a disabled notice rather than opening a
+browser. A lookup or browser launch already running can finish; disabling
+does not cancel an HTTP request or close an existing browser. Completed lookup
+data may remain cached but stays hidden until re-enabled. Existing cache files
+are retained, so turning it back on can reuse verified times.
+
+`h` only toggles in Settings when the proxy edit field is not active; typing
+`h` into a proxy URL does not change the preference.
+
 ## Matching and failures
 
 The lookup searches the public HLTB website by game title, prioritizes exact
@@ -64,7 +87,9 @@ no authentication tokens are recorded. The token in HTTP tests is synthetic.
 Provider and cache tests live in `src/interface/hltb_tests.rs`, model/render
 regressions in `src/interface/game.rs`, and menu tests in `tests/hltb_view.rs`.
 The render regression includes installation data, long descriptions, cached
-results, and small panes. Run the tests without external services:
+results, and small panes. Switch tests cover legacy config defaults, persisted
+off/on values, suppressed cached results and actions, failed saves, and access
+without a working launcher. Run the tests without external services:
 
 ```bash
 cargo test --locked
@@ -82,7 +107,9 @@ by the browse model; completion-time formatting belongs to `ui::hltb`. The
 provider does not render UI or launch processes. Native TLS remains unchanged.
 
 On Linux, a terminal smoke test covers `t` and the Actions menu with both
-successful and failing browser launchers. It uses a fake Steam backend, a
+successful and failing browser launchers, plus the Settings toggle and a
+startup with HLTB disabled. The toggle scenario also verifies proxy typing and
+that a later favourite save retains the preference. It uses a fake Steam backend, a
 seeded HLTB cache, and an `xdg-open` stub; it does not open your real browser.
 The existing ProtonDB lookup can still run in the background.
 

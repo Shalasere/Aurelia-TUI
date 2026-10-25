@@ -30,6 +30,12 @@ def run(binary, action, fail_launcher):
             "install_dir": "/games/Portal", "update_available": False, "size": 0,
         }
         (root / "games.json").write_text(json.dumps([game]))
+        if action == "disabled":
+            (root / "config.json").write_text(json.dumps({
+                "default_user": "", "hidden_games": [], "favorite_games": [],
+                "allowed_games": ["Game", "DLC"], "highlight": {"Rgb": [102, 192, 244]},
+                "hltb_enabled": False,
+            }))
         (root / "hltb").mkdir()
         (root / "hltb/400.json").write_text(json.dumps({
             "version": 1, "steam_id": 400, "fetched_at": int(time.time()),
@@ -46,6 +52,9 @@ elif sys.argv[1] == 'login':
 elif sys.argv[1] == 'info':
     print(json.dumps({'app_id': 400, 'name': 'Portal', 'developers': ['Valve'],
                       'publishers': ['Valve'], 'description': 'Aperture Science offers puzzles.'}))
+elif sys.argv[1] == 'config':
+    print(json.dumps({'error': 'fixture launcher settings unavailable'}))
+    sys.exit(1)
 else:
     print('{}')
 ''')
@@ -80,10 +89,55 @@ else:
                     return
             raise AssertionError(f"terminal check failed: {bytes(output[-1500:])!r}")
 
+        def config_data():
+            # A concurrent fs::write may briefly expose an empty config file.
+            try:
+                return json.loads((root / "config.json").read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return {}
+
+        def escape():
+            # Send Escape separately so a terminal parser cannot interpret the
+            # following letter as one Alt+letter event.
+            os.write(terminal, b"\x1b")
+            time.sleep(0.1)
+
         try:
+            if action == "disabled":
+                read_until(lambda text: b"Aperture" in text)
+                os.write(terminal, b"t")
+                read_until(lambda text: b"HLTBisdisabled" in text)
+                assert not (root / "opened-url").exists()
+                assert config_data().get("hltb_enabled") is False
+                print("PASS: startup disabled, cached browser action blocked")
+                return
             read_until(lambda text: all(value in text for value in
                                        [b"3h7m", b"5h16m", b"10h32m", b"Aperture"]))
-            if action == "menu":
+            if action == "toggle":
+                # Local settings must work even though the fake launcher fails
+                # config reads. While editing a proxy, h remains ordinary text.
+                os.write(terminal, b"p")
+                read_until(lambda text: b"HowLongToBeat[h]" in text and b"Launchersettingsunavailable" in text)
+                os.write(terminal, b"eh")
+                read_until(lambda text: b"h_" in text)
+                assert config_data().get("hltb_enabled") is True
+                escape()
+                os.write(terminal, b"h")
+                read_until(lambda _: config_data().get("hltb_enabled") is False)
+                escape()
+                os.write(terminal, b"t")
+                read_until(lambda text: b"HLTBisdisabled" in text)
+                assert not (root / "opened-url").exists()
+                # Other settings writes must retain the switch's new value;
+                # this catches an out-of-date config copy in the event loop.
+                os.write(terminal, b"f")
+                read_until(lambda _: 400 in config_data().get("favorite_games", []))
+                assert config_data().get("hltb_enabled") is False
+                os.write(terminal, b"ph")
+                read_until(lambda _: config_data().get("hltb_enabled") is True)
+                escape()
+                os.write(terminal, b"t")
+            elif action == "menu":
                 os.write(terminal, b"\r")
                 read_until(lambda text: b"HowLongToBeatpage" in text)
                 os.write(terminal, b"howlongtobeat\r")
@@ -95,6 +149,10 @@ else:
                 read_until(lambda text: b"Browserlauncherexited" in text)
             print(f"PASS: {action}, launcher {'failure notice' if fail_launcher else 'success'}")
         finally:
+            # A failed assertion may leave an editor or overlay open. Escape
+            # both before q so teardown does not type q into the edit buffer.
+            escape()
+            escape()
             os.write(terminal, b"q")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
@@ -121,3 +179,5 @@ if __name__ == "__main__":
     for method in ["shortcut", "menu"]:
         for fails in [False, True]:
             run(executable, method, fails)
+    run(executable, "toggle", False)
+    run(executable, "disabled", False)

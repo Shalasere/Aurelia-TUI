@@ -2338,13 +2338,22 @@ impl Browser {
         Ok(())
     }
 
-    /// Fetch the launcher configuration (`aurelia config show`) and open the
-    /// config overlay. Blocking; returns the backend error if the call fails.
+    /// Open local preferences even if the launcher's settings cannot be read.
+    /// Launcher fetches remain blocking, matching this overlay's existing path;
+    /// a failure is reported but cannot make the local HLTB switch unreachable.
     pub fn open_config(&mut self) -> Result<(), STError> {
-        self.config_info = Some(aurelia::config_show()?);
+        self.show_config = true;
+        self.config_info = None;
+        self.config_proxy = None;
+        match aurelia::config_show() {
+            Ok(info) => self.config_info = Some(info),
+            Err(error) => {
+                self.notice = Some(format!("Launcher settings unavailable: {error}"));
+                return Err(error);
+            }
+        }
         // Best-effort: a missing/failed proxy read just leaves the row blank.
         self.config_proxy = aurelia::config_proxy_show().ok();
-        self.show_config = true;
         Ok(())
     }
 
@@ -2881,6 +2890,11 @@ impl Browser {
     /// Shared by the Actions menu and `t`; only a verified HLTB page is opened.
     pub fn open_hltb(&mut self) {
         use crate::interface::hltb::HltbState;
+        // The shortcut must obey the same preference as the hidden menu entry.
+        if !Config::cached().hltb_enabled {
+            self.notice = Some("HLTB is disabled; enable it in Settings (p, then h)".into());
+            return;
+        }
         let Some(game) = self.selected() else {
             return;
         };
@@ -2905,10 +2919,15 @@ impl Browser {
     }
 
     pub fn poll_hltb(&mut self) {
-        if let Ok(mut slot) = self.hltb_open_pending.lock()
-            && let Some(Err(error)) = slot.take()
-        {
-            self.notice = Some(format!("HLTB: {error}"));
+        if let Ok(mut slot) = self.hltb_open_pending.lock() {
+            // Drain even while disabled: an opener already running when the
+            // switch changed must not surface a late result after re-enabling.
+            let result = slot.take();
+            if Config::cached().hltb_enabled
+                && let Some(Err(error)) = result
+            {
+                self.notice = Some(format!("HLTB: {error}"));
+            }
         }
     }
 
@@ -2952,7 +2971,9 @@ impl Browser {
         rows.push(ActionRow { action: Action::LaunchOptions, category: RT, label: "Launch options", key: "L" });
 
         const CONTENT: &str = "Content";
-        rows.push(ActionRow { action: Action::Hltb, category: CONTENT, label: "HowLongToBeat page", key: "t" });
+        if Config::cached().hltb_enabled {
+            rows.push(ActionRow { action: Action::Hltb, category: CONTENT, label: "HowLongToBeat page", key: "t" });
+        }
         rows.push(ActionRow { action: Action::Dlc, category: CONTENT, label: "DLC", key: "D" });
         rows.push(ActionRow { action: Action::Workshop, category: CONTENT, label: "Workshop", key: "W" });
         rows.push(ActionRow { action: Action::Cloud, category: CONTENT, label: "Cloud saves", key: "C" });

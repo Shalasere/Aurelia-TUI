@@ -108,7 +108,7 @@ version. Press `?` any time for the full key list.
 | `m` / `S` / `w` | Market listings, market search, wallet |
 | `R` | Running games |
 | `f` / `H` | Toggle favourite, hide the game |
-| `A` / `p` | Account, settings (presence, proxy) |
+| `A` / `p` | Account, settings (HLTB, presence, proxy) |
 | `r` | Refresh the library from Steam |
 | `l` | Sign in again |
 | `?` | Toggle the help overlay |
@@ -136,7 +136,8 @@ pane shows Main Story, Main + Extras, and Completionist times; `—` means no
 submitted time for that style. Press `t` (or choose **HowLongToBeat page** in
 Actions) to open the verified match. `Cached` marks an older result retained
 after a failed refresh. See [HowLongToBeat](docs/HOWLONGTOBEAT.md) for matching,
-cache, and troubleshooting details.
+cache, and troubleshooting details. To disable HLTB lookups and hide its
+content, press `p`, then `h`; the setting is saved locally.
 
 ## Features not in the help
 
@@ -162,7 +163,7 @@ field in the config to include any of `Game`, `DLC`, `Driver`, `Application`,
 
 | Path | Contents | Override |
 | --- | --- | --- |
-| `~/.config/aurelia-tui/` | `config.json` (favourites, hidden games, allowed types, highlight colour) | `AURELIA_TUI_DIR` |
+| `~/.config/aurelia-tui/` | `config.json` (favourites, hidden games, allowed types, highlight colour, HLTB preference) | `AURELIA_TUI_DIR` |
 | `~/.cache/aurelia-tui/` | cached library (`games.json`) | `AURELIA_TUI_CACHE_DIR` |
 | `~/.cache/aurelia-tui/hltb/` | cached HowLongToBeat matches and completion times | `AURELIA_TUI_CACHE_DIR` (parent directory) |
 | `~/.cache/aurelia-tui/icons/` | cached cover art | `AURELIA_TUI_ICON_DIR` |
