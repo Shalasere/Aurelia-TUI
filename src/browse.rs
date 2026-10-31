@@ -2908,8 +2908,9 @@ impl Browser {
                     }
                 });
             }
-            HltbState::Unavailable(error) => {
-                self.notice = Some(format!("HLTB: {error}. Press r to retry."))
+            HltbState::Unavailable(_) => {
+                game.retry_hltb();
+                self.notice = Some("HLTB: No Data; retry requested".into());
             }
             HltbState::NotFound => self.notice = Some("HLTB: no verified Steam match".into()),
             HltbState::Pending | HltbState::Loading => {

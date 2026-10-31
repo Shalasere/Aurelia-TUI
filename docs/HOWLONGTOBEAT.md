@@ -23,7 +23,7 @@ integration settings such as Luxtorpeda. HLTB's preference is owned by the TUI,
 while runtime-plugin settings are owned by the separate Aurelia launcher.
 The local switch remains accessible if reading launcher settings fails.
 
-When off, no new HLTB lookup is scheduled, its detail content and Actions menu
+When off, no new lookup through PCGamingWiki or HLTB is scheduled, its detail content and Actions menu
 entry are hidden, and `t` displays a disabled notice rather than opening a
 browser. A lookup or browser launch already running can finish; disabling
 does not cancel an HTTP request or close an existing browser. Completed lookup
@@ -35,34 +35,76 @@ are retained, so turning it back on can reuse verified times.
 
 ## Matching and failures
 
-The lookup searches the public HLTB website by game title, prioritizes exact
-normalized title/alias matches, and checks up to three candidates. A result is
-shown only if its game page contains the selected Steam app ID in
+The primary lookup uses PCGamingWiki's anonymous MediaWiki API: `idlookup`
+resolves the Steam app ID to a wiki page, then `parse` reads its game infobox.
+The page must confirm the Steam app ID and provide a numeric `hltb` ID. Multiple
+matching wiki pages, malformed fields, and inconsistent identities are rejected.
+PCGamingWiki supplies the page mapping; completion estimates still come from
+HLTB, so this is not an independent source of times during an HLTB outage.
+
+If the mapping is missing or PCGamingWiki fails, the lookup falls back to HLTB
+title search, prioritizes exact normalized title/alias matches, and checks up
+to three candidates. A result from either route is shown only if its HLTB game
+page contains the selected Steam app ID in
 `profile_steam` or `profile_steam_alt`. This is deliberately conservative:
 **No verified match** can mean HLTB's Steam association is missing or the match
 was outside the checked candidates. There is no title-only fallback.
 
-**Unavailable** means the lookup failed, not that the game has no entry.
-Press `t` to see the failure reason in the status notice. **Cached** means a
-previously verified result is displayed because its refresh failed; it does
-not necessarily mean your network is offline. HTTP, response-format, and cache
-write errors also go through the project's diagnostic logger (stderr when
-redirected).
+**No Data** means the lookup failed, not that the game has no entry.
+Press `t` (or choose the HLTB action) to retry without reloading the Steam
+library or restarting the app. Failure details go to the diagnostic logger.
+**Cached** means a previously verified result is displayed because its refresh
+failed; it does not necessarily mean your network is offline. HTTP,
+response-format, and cache write errors also go through the project's
+diagnostic logger (stderr when redirected).
 
 Press `r` to refresh the library and retry failed lookups. Lookups run once per
-game per library load, after input has settled, with at most one worker active.
+game per library load unless a failure is explicitly retried, after input has
+settled, with at most one worker active. Browsing and game actions remain
+available while the worker runs; other HLTB lookups wait for that worker.
 Each network lookup has a 30-second budget and eight-second request timeouts.
-HTTP 429 stops the lookup and defers further network lookups for one minute;
-refresh after that interval to retry.
+HLTB HTTP 429 stops the lookup and defers further HLTB requests for one minute;
+retry after that interval. PCGamingWiki has its own one-minute cooldown after
+HTTP 429 or a MediaWiki `ratelimited` error; HLTB search remains available.
+Wiki API request starts are spaced at least one second apart within this app
+instance to respect its documented 60 requests/minute limit. Waiting happens
+on the worker and counts toward the same lookup deadline.
+
+There is no fixed retry count per game. The primary route normally makes three
+requests: two to PCGamingWiki and one to the mapped HLTB game page. A cached
+mapping needs only the HLTB page request. An expired positive estimate also
+normally needs just one request to its already verified game page, before
+consulting PCGamingWiki. Every fetched HLTB page is verified again. Removed
+pages or changed associations fall through to mapping/search; transport/schema
+failures preserve stale data without starting another search. Fresh positive
+and negative estimate cache hits contact neither service.
+
+Fallback title search normally needs five HLTB requests with a newly discovered
+endpoint: homepage, index script, token initialization, search, and game page.
+Later title searches normally need two because the endpoint and token are
+reused in memory. Wiki requests before a fallback add to that total.
+
+Discovery may inspect up to twelve scripts, and verification checks up to three
+candidate pages. A reused token rejected with 401/403 is renewed once before
+rediscovery is considered. A 401/403/404 from the search/token route can trigger
+one rediscovery attempt, within the original lookup budget. Rate limits and
+server errors do not trigger token renewal or rediscovery.
 
 ## Cache
 
 Entries live at `~/.cache/aurelia-tui/hltb/<steam-app-id>.json`, beneath
 `AURELIA_TUI_CACHE_DIR` when overridden. Positive matches are reused for seven
 days and negative matches for one day, checked when the next lookup starts.
-In-memory results remain unchanged until the library is reloaded. Failed
-requests are never stored as negative matches. Expired positive results remain
+Successful in-memory results remain unchanged until the library is reloaded.
+Failed requests are never stored as negative matches. Expired positive results remain
 available if a refresh fails; their timestamps are not extended.
+
+PCGamingWiki mappings live in `hltb/pcgamingwiki/<steam-app-id>.json`, under
+the same cache directory. Mappings last seven days and successful missing
+mappings one day. They are hints, not verified completion data, and are stored
+separately so a failed HLTB request can be retried without repeating the wiki
+requests. HTTP/schema errors are not cached as missing mappings. A wiki outage
+followed by an empty HLTB search is a failure rather than a cached missing game.
 
 To force a lookup, remove just that game's cache entry and press `r`. For Portal:
 
@@ -75,11 +117,19 @@ Writes use a temporary file in the same directory followed by a rename.
 
 ## Maintaining and testing
 
-The provider in `src/interface/hltb.rs` uses public website search and game
-pages, whose structure can change. It discovers the search endpoint from the
+The provider in `src/interface/hltb.rs` uses PCGamingWiki's
+[documented API](https://www.pcgamingwiki.com/wiki/API) and
+[infobox identifiers](https://www.pcgamingwiki.com/wiki/Template:Infobox_game/Documentation).
+The wiki client sends an identifying user agent and does not share HLTB's
+Origin/Referer headers. It ignores commented-out infobox fields and never
+executes wiki templates or follows arbitrary links from page content.
+
+The HLTB fallback uses public website search and game pages, whose structure
+can change. It discovers the search endpoint from the
 homepage's Next.js scripts and obtains a short-lived token through that
-endpoint's `/init` route. It rediscovers the endpoint once after HTTP
-401/403/404; it does not retry rate limits or server errors this way. It checks
+endpoint's `/init` route. It reuses that token in memory and renews it when
+rejected. It rediscovers the endpoint at most once after HTTP 401/403/404;
+it does not retry rate limits or server errors this way. It checks
 at most twelve script references and reuses the HTTP client and endpoint.
 The fixtures contain only the public fields needed for matching and times;
 no authentication tokens are recorded. The token in HTTP tests is synthetic.
@@ -95,10 +145,13 @@ without a working launcher. Run the tests without external services:
 cargo test --locked
 ```
 
-An opt-in live check covers Portal, Lost Ruins, and Graveyard Keeper. It needs
-internet access but no Steam login:
+Opt-in live checks cover Portal, Lost Ruins, and Graveyard Keeper. The wiki
+check asserts that mappings work without discovering an HLTB search endpoint;
+the other check exercises fallback search, token reuse, and direct refresh.
+They need internet access but no Steam login:
 
 ```bash
+cargo test --locked live_pcgamingwiki_matches -- --ignored --nocapture
 cargo test --locked live_steam_matches -- --ignored --nocapture
 ```
 
@@ -108,7 +161,9 @@ provider does not render UI or launch processes. Native TLS remains unchanged.
 
 On Linux, a terminal smoke test covers `t` and the Actions menu with both
 successful and failing browser launchers, plus the Settings toggle and a
-startup with HLTB disabled. The toggle scenario also verifies proxy typing and
+startup with HLTB disabled. An offline scenario checks failure rendering,
+retry, and library navigation through a refused local proxy connection.
+The toggle scenario also verifies proxy typing and
 that a later favourite save retains the preference. It uses a fake Steam backend, a
 seeded HLTB cache, and an `xdg-open` stub; it does not open your real browser.
 The existing ProtonDB lookup can still run in the background.

@@ -145,6 +145,10 @@ impl Game {
     /// service is busy, leave Pending so only a still-selected game retries on
     /// a later idle tick; do not queue every game the user scrolled past.
     pub fn query_hltb(&self) {
+        self.query_hltb_with(hltb::lookup);
+    }
+
+    fn query_hltb_with(&self, lookup: impl FnOnce(i32, &str) -> HltbState + Send + 'static) {
         // Guard here as well as in the idle dispatcher so callers cannot start
         // HLTB work while disabled, even when a cached result already exists.
         if !Config::cached().hltb_enabled {
@@ -168,7 +172,7 @@ impl Game {
             // A toggle can change after scheduling but before this thread runs.
             // Leave the game retryable if it was disabled in that interval.
             let result = if Config::cached().hltb_enabled {
-                hltb::lookup(id, &name)
+                lookup(id, &name)
             } else {
                 HltbState::Pending
             };
@@ -178,8 +182,18 @@ impl Game {
         });
     }
 
+    /// Retry only failures, without reloading the Steam library. Leave scheduling
+    /// to the idle dispatcher so repeated input cannot queue network requests.
+    pub fn retry_hltb(&self) {
+        if let Ok(mut state) = self.hltb.lock()
+            && matches!(*state, HltbState::Unavailable(_))
+        {
+            *state = HltbState::Pending;
+        }
+    }
+
     /// Rendering reads only the shared snapshot; cache and network I/O stay on
-    /// the worker. Terminal states are retried by reloading the library (`r`).
+    /// the worker. Failed lookups can be retried with `t` or a library reload.
     pub fn get_hltb(&self) -> HltbState {
         self.hltb
             .lock()
@@ -344,6 +358,108 @@ mod hltb_tests {
             matches!(game.get_hltb(), HltbState::Unavailable(_)),
             "failed lookups do not retry every frame"
         );
+    }
+
+    #[test]
+    fn browsing_remains_available_during_lookup_and_failures_can_be_retried() {
+        let _serial = hltb::WORKER_TEST_LOCK.lock().unwrap();
+        let game = portal();
+        let mut other = portal();
+        other.id = 620;
+        other.name = "Portal 2".into();
+        let mut browser = crate::browse::Browser::new(vec![game.clone(), other.clone()]);
+        let (release, blocked) = std::sync::mpsc::channel();
+        game.query_hltb_with(move |_, _| {
+            // A bounded gate keeps a blocking regression from hanging the suite.
+            let _ = blocked.recv_timeout(std::time::Duration::from_secs(2));
+            HltbState::Unavailable("connection lost".into())
+        });
+        assert!(matches!(game.get_hltb(), HltbState::Loading));
+        other.query_hltb_with(|_, _| panic!("a busy worker must not queue another lookup"));
+        assert!(matches!(other.get_hltb(), HltbState::Pending));
+        browser.select_index(1);
+        assert_eq!(browser.selected().unwrap().id, 620);
+        assert!(
+            browser
+                .action_candidates()
+                .iter()
+                .any(|row| row.action == crate::browse::Action::Play)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    crate::ui::detail::detail(Some(&game), false, 60, 22),
+                    f.size(),
+                )
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matches!(game.get_hltb(), HltbState::Loading) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not publish its failure"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(game.get_hltb(), HltbState::Unavailable(_)));
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    crate::ui::detail::detail(Some(&game), false, 60, 22),
+                    f.size(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..24).any(|y| {
+            (0..80)
+                .map(|x| buffer.get(x, y).symbol.as_str())
+                .collect::<String>()
+                .contains("No Data")
+        }));
+
+        browser.select_index(0);
+        browser.open_hltb();
+        assert!(
+            browser
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("retry requested")
+        );
+        assert!(matches!(game.get_hltb(), HltbState::Pending));
+        // Retry without a library refresh, credentials, or any real network.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matches!(game.get_hltb(), HltbState::Pending) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed worker retained its permit"
+            );
+            game.query_hltb_with(|_, _| HltbState::NotFound);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while matches!(game.get_hltb(), HltbState::Loading) {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(game.get_hltb(), HltbState::NotFound));
+        game.retry_hltb();
+        assert!(
+            matches!(game.get_hltb(), HltbState::NotFound),
+            "successful misses retain their cache policy"
+        );
+        // Publishing the snapshot precedes the worker's final permit drop.
+        // Wait for that drop before another test exercises the global permit.
+        loop {
+            if let Some(permit) = hltb::reserve() {
+                drop(permit);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]

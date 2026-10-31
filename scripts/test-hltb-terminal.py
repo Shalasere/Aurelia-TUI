@@ -13,6 +13,7 @@ import pty
 import re
 import select
 import signal
+import socket
 import struct
 import sys
 import tempfile
@@ -29,7 +30,10 @@ def run(binary, action, fail_launcher):
             "icon_url": None, "cover_url": None, "installed": True,
             "install_dir": "/games/Portal", "update_available": False, "size": 0,
         }
-        (root / "games.json").write_text(json.dumps([game]))
+        games = [game]
+        if action == "offline":
+            games.append(dict(game, id=620, name="Portal 2"))
+        (root / "games.json").write_text(json.dumps(games))
         if action == "disabled":
             (root / "config.json").write_text(json.dumps({
                 "default_user": "", "hidden_games": [], "favorite_games": [],
@@ -42,6 +46,13 @@ def run(binary, action, fail_launcher):
             "data": {"game_id": 7230, "game_name": "Portal", "main": 11230,
                      "extra": 18943, "completionist": 37927},
         }))
+        # A bound, non-listening socket refuses connections without contacting
+        # HLTB or depending on the machine's actual network connectivity.
+        offline_proxy = None
+        if action == "offline":
+            (root / "hltb/400.json").unlink()
+            offline_proxy = socket.socket()
+            offline_proxy.bind(("127.0.0.1", 0))
         backend = root / "fake-aurelia"
         backend.write_text(f"#!{sys.executable}\n" + '''
 import json, sys
@@ -71,6 +82,12 @@ else:
             environment = dict(os.environ, AURELIA_BIN=str(backend),
                                AURELIA_TUI_DIR=str(root), AURELIA_TUI_CACHE_DIR=str(root),
                                TERM="xterm-256color", PATH=f"{root}:{os.environ['PATH']}")
+            if offline_proxy is not None:
+                proxy = f"http://127.0.0.1:{offline_proxy.getsockname()[1]}"
+                environment.update(HTTPS_PROXY=proxy, https_proxy=proxy,
+                                   HTTP_PROXY=proxy, http_proxy=proxy,
+                                   ALL_PROXY=proxy, all_proxy=proxy,
+                                   NO_PROXY="", no_proxy="")
             os.execve(binary, [binary], environment)
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
         output = bytearray()
@@ -103,6 +120,16 @@ else:
             time.sleep(0.1)
 
         try:
+            if action == "offline":
+                read_until(lambda text: b"NoData" in text and b"Aperture" in text)
+                os.write(terminal, b"t")
+                read_until(lambda text: b"retryrequested" in text)
+                os.write(terminal, b"jf")
+                read_until(lambda _: 620 in config_data().get("favorite_games", []))
+                assert not (root / "hltb/400.json").exists()
+                assert not (root / "opened-url").exists()
+                print("PASS: offline failure, No Data, retry and library navigation")
+                return
             if action == "disabled":
                 read_until(lambda text: b"Aperture" in text)
                 os.write(terminal, b"t")
@@ -169,6 +196,8 @@ else:
                 os.waitpid(pid, 0)
                 raise AssertionError("TUI did not exit after q")
             os.close(terminal)
+            if offline_proxy is not None:
+                offline_proxy.close()
             assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, f"TUI exit status: {status}"
 
 
@@ -181,3 +210,4 @@ if __name__ == "__main__":
             run(executable, method, fails)
     run(executable, "toggle", False)
     run(executable, "disabled", False)
+    run(executable, "offline", False)

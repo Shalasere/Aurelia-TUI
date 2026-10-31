@@ -60,13 +60,16 @@ fn versioned_cache_handles_expiry_corruption_and_failed_refreshes() {
     assert!(!cached.fresh(DAY - 1));
     write_cache(&path, &cached).unwrap();
     assert!(matches!(
-        lookup_cached(Some(&path), 400, DAY, || panic!(
+        lookup_cached(Some(&path), 400, DAY, |_| panic!(
             "fresh data must skip network"
         )),
         HltbState::Ready { stale: false, .. }
     ));
     assert!(matches!(
-        lookup_cached(Some(&path), 400, 9 * DAY, || Err("schema changed".into())),
+        lookup_cached(Some(&path), 400, 9 * DAY, |game_id| {
+            assert_eq!(game_id, Some(7230));
+            Err("schema changed".into())
+        }),
         HltbState::Ready { stale: true, .. }
     ));
     assert_eq!(read_cache(&path, 400).unwrap().fetched_at, DAY);
@@ -76,7 +79,7 @@ fn versioned_cache_handles_expiry_corruption_and_failed_refreshes() {
     assert!(!cached.fresh(2 * DAY));
     write_cache(&path, &cached).unwrap();
     assert!(matches!(
-        lookup_cached(Some(&path), 400, DAY, || panic!(
+        lookup_cached(Some(&path), 400, DAY, |_| panic!(
             "fresh miss must skip network"
         )),
         HltbState::NotFound
@@ -88,14 +91,14 @@ fn versioned_cache_handles_expiry_corruption_and_failed_refreshes() {
     assert!(read_cache(&path, 400).is_none());
     fs::remove_file(&path).unwrap();
     assert!(
-        matches!(lookup_cached(Some(&path), 400, DAY, || Err("HTTP 429".into())), HltbState::Unavailable(e) if e == "HTTP 429")
+        matches!(lookup_cached(Some(&path), 400, DAY, |_| Err("HTTP 429".into())), HltbState::Unavailable(e) if e == "HTTP 429")
     );
     assert!(
         !path.exists(),
         "errors must never become negative cache entries"
     );
     assert!(matches!(
-        lookup_cached(Some(&path), 400, now(), || Ok(None)),
+        lookup_cached(Some(&path), 400, now(), |_| Ok(None)),
         HltbState::NotFound
     ));
     assert!(read_cache(&path, 400).unwrap().fresh(now()));
@@ -103,7 +106,33 @@ fn versioned_cache_handles_expiry_corruption_and_failed_refreshes() {
 }
 
 #[test]
+fn successful_lookups_persist_and_cache_write_failures_keep_the_result() {
+    let dir = std::env::temp_dir().join(format!("aurelia-hltb-persist-{}", std::process::id()));
+    let path = dir.join("400.json");
+    assert!(matches!(
+        lookup_cached(Some(&path), 400, now(), |_| Ok(Some(data()))),
+        HltbState::Ready { stale: false, .. }
+    ));
+    assert_eq!(read_cache(&path, 400).unwrap().data, Some(data()));
+    // A new lookup reads the persisted file, with no in-memory result to reuse.
+    assert!(matches!(
+        lookup_cached(Some(&path), 400, now(), |_| panic!(
+            "persisted hit must skip network"
+        )),
+        HltbState::Ready { stale: false, .. }
+    ));
+    let unwritable = dir.join("directory-instead-of-file.json");
+    fs::create_dir(&unwritable).unwrap();
+    assert!(matches!(
+        lookup_cached(Some(&unwritable), 400, now(), |_| Ok(Some(data()))),
+        HltbState::Ready { stale: false, .. }
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn only_one_background_worker_can_be_reserved_and_it_is_released() {
+    let _serial = WORKER_TEST_LOCK.lock().unwrap();
     let first = reserve().expect("first worker");
     assert!(reserve().is_none());
     drop(first);
@@ -205,6 +234,11 @@ impl Server {
                     "unexpected request: {raw}"
                 );
                 captured.lock().unwrap().push(raw);
+                // Status zero models a peer dropping the connection before it
+                // sends any HTTP response, rather than a normal HTTP failure.
+                if step.status == 0 {
+                    continue;
+                }
                 write!(
                     socket,
                     "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -250,23 +284,302 @@ fn results(ids: &[u64]) -> String {
     json!({"data":ids.iter().map(|id| json!({"game_id":id,"game_name":"Portal"})).collect::<Vec<_>>()} ).to_string()
 }
 
+fn wiki_lookup_response(title: &str) -> String {
+    json!({"idlookup": [{"title": {"Page": title}}]}).to_string()
+}
+
+fn wiki_page_response(text: &str) -> String {
+    json!({"parse": {"title": "Portal", "wikitext": {"*": text}}}).to_string()
+}
+
+fn wiki_steps(text: &str) -> Vec<Step> {
+    vec![
+        Step::get(
+            "/w/api.php?action=idlookup&field=steamappid&value=400&format=json",
+            wiki_lookup_response("Portal"),
+        ),
+        Step::get(
+            "/w/api.php?action=parse&page=Portal&prop=wikitext&redirects=1&format=json",
+            wiki_page_response(text),
+        ),
+    ]
+}
+
+const WIKI_PORTAL: &str = "{{Infobox game\n|developers = {{Infobox game/row/developer|Valve}}\n|steam appid = 400\n|steam appid side = 323170\n|hltb = 7230\n}}";
+
 #[test]
-fn http_lookup_checks_headers_payload_identity_and_reuses_endpoint() {
-    let mut steps = discovery();
-    for _ in 0..2 {
+fn wiki_infobox_mapping_requires_unambiguous_numeric_ids_and_the_selected_steam_app() {
+    assert_eq!(wiki_game_id(WIKI_PORTAL, 400).unwrap(), Some(7230));
+    assert_eq!(wiki_game_id(WIKI_PORTAL, 323170).unwrap(), Some(7230));
+    assert!(wiki_game_id(WIKI_PORTAL, 620).is_err());
+    assert_eq!(
+        wiki_game_id(&WIKI_PORTAL.replace("|hltb = 7230", "|hltb = "), 400).unwrap(),
+        None
+    );
+    assert!(wiki_game_id(&WIKI_PORTAL.replace("7230", "not an ID"), 400).is_err());
+    assert!(wiki_game_id(&WIKI_PORTAL.replace("7230", "0"), 400).is_err());
+    assert!(
+        wiki_game_id(
+            &WIKI_PORTAL.replace("|hltb = 7230", "|hltb = 7230\n|hltb = 999"),
+            400
+        )
+        .is_err()
+    );
+    assert!(wiki_game_id("|steam appid = 400\n|hltb = 7230", 400).is_err());
+    assert!(wiki_game_id("{{Infobox game\n|steam appid = 400\n|hltb = 7230", 400).is_err());
+    let text = format!("<!-- {{}} |hltb = 999 -->\n{WIKI_PORTAL}\n|hltb = 123");
+    assert_eq!(wiki_game_id(&text, 400).unwrap(), Some(7230));
+    let text = WIKI_PORTAL.replace("|hltb = 7230", "|hltb = <!-- former ID --> 7230");
+    assert_eq!(wiki_game_id(&text, 400).unwrap(), Some(7230));
+}
+
+#[test]
+fn wiki_primary_lookup_uses_three_requests_and_persists_the_mapping() {
+    let dir = std::env::temp_dir().join(format!("aurelia-wiki-primary-{}", std::process::id()));
+    let wiki_server = Server::start(wiki_steps(WIKI_PORTAL));
+    let hltb_server = Server::start(vec![Step::get("/game/7230", page(game()))]);
+    let wiki = PcGamingWiki::new(&wiki_server.base, Some(dir.clone())).unwrap();
+    let mut provider = Provider::new(&hltb_server.base, Some(wiki)).unwrap();
+    let started = Instant::now();
+    assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "API request starts must be paced"
+    );
+    assert!(provider.endpoint.is_none());
+    assert!(provider.token.is_none());
+    let requests = wiki_server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let headers = request.to_ascii_lowercase();
+        assert!(request.contains(WIKI_USER_AGENT));
+        assert!(!headers.contains("\r\norigin:"));
+        assert!(!headers.contains("\r\nreferer:"));
+    }
+    assert_eq!(hltb_server.finish().len(), 1);
+    let mut restored = PcGamingWiki::new("http://127.0.0.1:0", Some(dir.clone())).unwrap();
+    assert_eq!(
+        restored
+            .lookup(400, Instant::now() - Duration::from_secs(1))
+            .unwrap(),
+        Some(7230)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn wiki_cache_validates_identity_expiry_and_schema_and_persists_missing_mappings() {
+    let mut cached = WikiCached {
+        version: WIKI_CACHE_VERSION,
+        steam_id: 400,
+        fetched_at: DAY,
+        game_id: Some(7230),
+    };
+    assert!(cached.fresh(400, 8 * DAY - 1));
+    assert!(!cached.fresh(400, 8 * DAY));
+    assert!(!cached.fresh(400, DAY - 1));
+    assert!(!cached.fresh(620, DAY));
+    cached.version = 0;
+    assert!(!cached.fresh(400, DAY));
+    cached.version = WIKI_CACHE_VERSION;
+    cached.game_id = Some(0);
+    assert!(!cached.fresh(400, DAY));
+    cached.game_id = None;
+    assert!(cached.fresh(400, 2 * DAY - 1));
+    assert!(!cached.fresh(400, 2 * DAY));
+
+    let dir = std::env::temp_dir().join(format!("aurelia-wiki-cache-{}", std::process::id()));
+    let path = dir.join("400.json");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(&path, "broken cache").unwrap();
+    let server = Server::start(vec![Step::get("/w/api.php?", r#"{"idlookup":[]}"#)]);
+    let mut wiki = PcGamingWiki::new(&server.base, Some(dir.clone())).unwrap();
+    assert_eq!(
+        wiki.lookup(400, Instant::now() + Duration::from_secs(2))
+            .unwrap(),
+        None
+    );
+    let stored: WikiCached = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(stored.fresh(400, now()));
+    assert!(stored.game_id.is_none());
+    assert_eq!(server.finish().len(), 1);
+    let mut restored = PcGamingWiki::new("http://127.0.0.1:0", Some(dir.clone())).unwrap();
+    assert_eq!(
+        restored
+            .lookup(400, Instant::now() - Duration::from_secs(1))
+            .unwrap(),
+        None
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_unavailable_and_invalid_wiki_mappings_fall_back_to_hltb_search() {
+    let cases = vec![
+        vec![Step::get("/w/api.php?", r#"{"idlookup":[]}"#)],
+        vec![Step::get("/w/api.php?", "unavailable").status(503)],
+        vec![Step::get("/w/api.php?", "not JSON")],
+        vec![Step::get(
+            "/w/api.php?",
+            r#"{"idlookup":[{"title":{"Page":"One"}},{"title":{"Page":"Two"}}]}"#,
+        )],
+        vec![Step::get("/w/api.php?", r#"{"idlookup":[{}]}"#)],
+        wiki_steps(&WIKI_PORTAL.replace("|hltb = 7230", "|hltb = ")),
+        wiki_steps(&WIKI_PORTAL.replace("|steam appid = 400", "|steam appid = 620")),
+    ];
+    for steps in cases {
+        let wiki_requests = steps.len();
+        let wiki_server = Server::start(steps);
+        let mut steps = discovery();
         steps.extend([
             auth(),
             Step::post(results(&[7230])),
             Step::get("/game/7230", page(game())),
         ]);
+        let hltb_server = Server::start(steps);
+        let wiki = PcGamingWiki::new(&wiki_server.base, None).unwrap();
+        let mut provider = Provider::new(&hltb_server.base, Some(wiki)).unwrap();
+        assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+        assert!(provider.endpoint.is_some());
+        assert_eq!(wiki_server.finish().len(), wiki_requests);
+        assert_eq!(hltb_server.finish().len(), 5);
+    }
+}
+
+#[test]
+fn wiki_mapping_cannot_bypass_hltb_steam_verification() {
+    let wiki_server = Server::start(wiki_steps(&WIKI_PORTAL.replace("7230", "1")));
+    let mut wrong_game = game();
+    wrong_game["game_id"] = json!(1);
+    wrong_game["profile_steam"] = json!(620);
+    wrong_game["profile_steam_alt"] = json!(0);
+    let mut steps = vec![Step::get("/game/1", page(wrong_game))];
+    steps.extend(discovery());
+    steps.extend([
+        auth(),
+        Step::post(results(&[7230])),
+        Step::get("/game/7230", page(game())),
+    ]);
+    let hltb_server = Server::start(steps);
+    let wiki = PcGamingWiki::new(&wiki_server.base, None).unwrap();
+    let mut provider = Provider::new(&hltb_server.base, Some(wiki)).unwrap();
+    assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+    assert_eq!(wiki_server.finish().len(), 2);
+    assert_eq!(hltb_server.finish().len(), 6);
+}
+
+#[test]
+fn wiki_rate_limits_do_not_disable_hltb_fallback_or_cache_failures() {
+    for step in [
+        Step::get("/w/api.php?", "limited").status(429),
+        Step::get("/w/api.php?", r#"{"error":{"code":"ratelimited"}}"#),
+    ] {
+        let dir = std::env::temp_dir().join(format!("aurelia-wiki-rate-{}", std::process::id()));
+        let wiki_server = Server::start(vec![step]);
+        let mut steps = discovery();
+        steps.push(auth());
+        for _ in 0..2 {
+            steps.extend([
+                Step::post(results(&[7230])),
+                Step::get("/game/7230", page(game())),
+            ]);
+        }
+        let hltb_server = Server::start(steps);
+        let wiki = PcGamingWiki::new(&wiki_server.base, Some(dir.clone())).unwrap();
+        let mut provider = Provider::new(&hltb_server.base, Some(wiki)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+        }
+        assert!(
+            provider.retry_after.is_none(),
+            "wiki throttling must not become HLTB throttling"
+        );
+        assert!(provider.wiki.as_ref().unwrap().retry_after.is_some());
+        assert!(!dir.join("400.json").exists());
+        assert_eq!(wiki_server.finish().len(), 1);
+        assert_eq!(hltb_server.finish().len(), 7);
+    }
+}
+
+#[test]
+fn wiki_outages_and_empty_hltb_searches_are_not_cached_as_missing_games() {
+    let dir = std::env::temp_dir().join(format!("aurelia-wiki-outage-{}", std::process::id()));
+    let path = dir.join("400.json");
+    let wiki_server = Server::start(vec![Step::get("/w/api.php?", "unavailable").status(503)]);
+    let mut steps = discovery();
+    steps.extend([auth(), Step::post(results(&[]))]);
+    let hltb_server = Server::start(steps);
+    let wiki = PcGamingWiki::new(&wiki_server.base, None).unwrap();
+    let mut provider = Provider::new(&hltb_server.base, Some(wiki)).unwrap();
+    let state = lookup_cached(Some(&path), 400, now(), |id| {
+        provider.fetch(400, "Portal", id).map_err(|e| e.to_string())
+    });
+    assert!(matches!(state, HltbState::Unavailable(_)));
+    assert!(!path.exists());
+    assert_eq!(wiki_server.finish().len(), 1);
+    assert_eq!(hltb_server.finish().len(), 4);
+}
+
+#[test]
+fn wiki_request_pacing_obeys_the_original_deadline() {
+    let mut wiki = PcGamingWiki::new("http://127.0.0.1:0", None).unwrap();
+    wiki.next_request = Some(Instant::now() + Duration::from_secs(2));
+    assert!(
+        wiki.json(&[], Instant::now() + Duration::from_millis(20))
+            .unwrap_err()
+            .to_string()
+            .contains("timed out")
+    );
+    wiki.next_request = None;
+    assert!(
+        wiki.json(&[], Instant::now() - Duration::from_secs(1))
+            .unwrap_err()
+            .to_string()
+            .contains("timed out")
+    );
+}
+
+#[test]
+#[ignore = "requires live PCGamingWiki and HowLongToBeat access"]
+fn live_pcgamingwiki_matches() {
+    let wiki = PcGamingWiki::new(WIKI_BASE, None).unwrap();
+    let mut provider = Provider::new(BASE, Some(wiki)).unwrap();
+    for (id, name) in [
+        (400, "Portal"),
+        (1306630, "Lost Ruins"),
+        (599140, "Graveyard Keeper"),
+    ] {
+        let data = provider
+            .fetch(id, name, None)
+            .unwrap()
+            .expect("verified HLTB match");
+        assert!(data.main.is_some(), "{name}");
+        assert!(
+            provider.endpoint.is_none(),
+            "{name}: primary wiki route fell back to search"
+        );
+        assert!(provider.token.is_none());
+        println!("PCGamingWiki → {name}: {}", data.url());
+    }
+}
+
+#[test]
+fn http_lookup_checks_headers_payload_identity_and_reuses_endpoint_and_token() {
+    let mut steps = discovery();
+    steps.push(auth());
+    for _ in 0..2 {
+        steps.extend([
+            Step::post(results(&[7230])),
+            Step::get("/game/7230", page(game())),
+        ]);
     }
     let server = Server::start(steps);
-    let mut provider = Provider::new(&server.base).unwrap();
+    let mut provider = Provider::new(&server.base, None).unwrap();
     for _ in 0..2 {
-        assert_eq!(provider.fetch(400, "Portal").unwrap(), Some(data()));
+        assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
     }
     let requests = server.finish();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 7);
     let request = &requests[3];
     assert!(
         request
@@ -289,6 +602,164 @@ fn http_lookup_checks_headers_payload_identity_and_reuses_endpoint() {
 }
 
 #[test]
+fn rejected_reused_tokens_are_renewed_without_rediscovering_the_endpoint() {
+    for status in [401, 403] {
+        let mut steps = discovery();
+        steps.extend([
+            auth(),
+            Step::post(results(&[7230])),
+            Step::get("/game/7230", page(game())),
+            Step::post("expired token").status(status),
+            Step::get("/api/search/site/init?", r#"{"token":"replacement-token"}"#),
+            Step::post(results(&[7230])),
+            Step::get("/game/7230", page(game())),
+        ]);
+        let server = Server::start(steps);
+        let mut provider = Provider::new(&server.base, None).unwrap();
+        for _ in 0..2 {
+            assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 9);
+        assert!(
+            requests[7]
+                .to_ascii_lowercase()
+                .contains("x-auth-token: replacement-token")
+        );
+    }
+}
+
+#[test]
+fn persistent_authentication_failures_stop_after_one_renewal_and_rediscovery() {
+    let mut steps = discovery();
+    steps.extend([
+        auth(),
+        Step::post(results(&[7230])),
+        Step::get("/game/7230", page(game())),
+        Step::post("expired token").status(401),
+        auth(),
+        Step::post("rejected fresh token").status(401),
+    ]);
+    steps.extend(discovery());
+    steps.extend([auth(), Step::post("still rejected").status(401)]);
+    let server = Server::start(steps);
+    let mut provider = Provider::new(&server.base, None).unwrap();
+    assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+    assert_eq!(
+        provider.fetch(400, "Portal", None).unwrap_err().status,
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    assert_eq!(server.finish().len(), 12);
+}
+
+#[test]
+fn expired_matches_refresh_and_reverify_with_one_page_request() {
+    let dir = std::env::temp_dir().join(format!("aurelia-hltb-refresh-{}", std::process::id()));
+    let path = dir.join("400.json");
+    write_cache(
+        &path,
+        &Cached {
+            version: CACHE_VERSION,
+            steam_id: 400,
+            fetched_at: DAY,
+            data: Some(data()),
+        },
+    )
+    .unwrap();
+    let mut updated = game();
+    updated["comp_main"] = json!(12345);
+    let server = Server::start(vec![Step::get("/game/7230", page(updated))]);
+    let mut provider = Provider::new(&server.base, None).unwrap();
+    let state = lookup_cached(Some(&path), 400, 9 * DAY, |game_id| {
+        provider
+            .fetch(400, "Portal", game_id)
+            .map_err(|e| e.to_string())
+    });
+    assert!(matches!(
+        state,
+        HltbState::Ready {
+            data: HltbData {
+                main: Some(12345),
+                ..
+            },
+            stale: false
+        }
+    ));
+    assert_eq!(
+        read_cache(&path, 400).unwrap().data.unwrap().main,
+        Some(12345)
+    );
+    assert_eq!(server.finish().len(), 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn removed_pages_and_changed_steam_associations_fall_back_to_search() {
+    let mut wrong_game = game();
+    wrong_game["game_id"] = json!(1);
+    wrong_game["profile_steam"] = json!(620);
+    wrong_game["profile_steam_alt"] = json!(0);
+    for first in [
+        Step::get("/game/1", "removed").status(404),
+        Step::get("/game/1", page(wrong_game)),
+    ] {
+        let mut steps = vec![first];
+        steps.extend(discovery());
+        steps.extend([
+            auth(),
+            Step::post(results(&[7230])),
+            Step::get("/game/7230", page(game())),
+        ]);
+        let server = Server::start(steps);
+        let mut provider = Provider::new(&server.base, None).unwrap();
+        assert_eq!(
+            provider.fetch(400, "Portal", Some(1)).unwrap(),
+            Some(data())
+        );
+        assert_eq!(server.finish().len(), 6);
+    }
+}
+
+#[test]
+fn failed_direct_refreshes_keep_stale_data_without_search_requests() {
+    let dir =
+        std::env::temp_dir().join(format!("aurelia-hltb-stale-refresh-{}", std::process::id()));
+    let path = dir.join("400.json");
+    write_cache(
+        &path,
+        &Cached {
+            version: CACHE_VERSION,
+            steam_id: 400,
+            fetched_at: DAY,
+            data: Some(data()),
+        },
+    )
+    .unwrap();
+    for status in [200, 429, 503] {
+        let server = Server::start(vec![Step::get("/game/7230", "broken page").status(status)]);
+        let mut provider = Provider::new(&server.base, None).unwrap();
+        let state = lookup_cached(Some(&path), 400, 9 * DAY, |game_id| {
+            provider
+                .fetch(400, "Portal", game_id)
+                .map_err(|e| e.to_string())
+        });
+        assert!(matches!(state, HltbState::Ready { stale: true, .. }));
+        assert_eq!(read_cache(&path, 400).unwrap().fetched_at, DAY);
+        if status == 429 {
+            assert!(
+                provider
+                    .fetch(620, "Portal 2", None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("wait a minute")
+            );
+        }
+        assert_eq!(server.finish().len(), 1);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn an_unreadable_candidate_does_not_hide_a_later_verified_match() {
     let mut steps = discovery();
     steps.extend([
@@ -299,9 +770,9 @@ fn an_unreadable_candidate_does_not_hide_a_later_verified_match() {
     ]);
     let server = Server::start(steps);
     assert_eq!(
-        Provider::new(&server.base)
+        Provider::new(&server.base, None)
             .unwrap()
-            .fetch(400, "Portal")
+            .fetch(400, "Portal", None)
             .unwrap(),
         Some(data())
     );
@@ -317,9 +788,9 @@ fn candidate_errors_are_not_reported_as_missing_games() {
         Step::get("/game/1", "broken page"),
     ]);
     let server = Server::start(steps);
-    let error = Provider::new(&server.base)
+    let error = Provider::new(&server.base, None)
         .unwrap()
-        .fetch(400, "Portal")
+        .fetch(400, "Portal", None)
         .unwrap_err();
     assert!(error.to_string().contains("page data missing"));
     server.finish();
@@ -330,14 +801,14 @@ fn rate_limits_stop_requests_and_apply_a_session_cooldown() {
     let mut steps = discovery();
     steps.extend([auth(), Step::post("rate limited").status(429)]);
     let server = Server::start(steps);
-    let mut provider = Provider::new(&server.base).unwrap();
+    let mut provider = Provider::new(&server.base, None).unwrap();
     assert_eq!(
-        provider.fetch(400, "Portal").unwrap_err().status,
+        provider.fetch(400, "Portal", None).unwrap_err().status,
         Some(StatusCode::TOO_MANY_REQUESTS)
     );
     assert!(
         provider
-            .fetch(620, "Portal 2")
+            .fetch(620, "Portal 2", None)
             .unwrap_err()
             .to_string()
             .contains("wait a minute")
@@ -357,9 +828,9 @@ fn a_changed_endpoint_is_rediscovered_once_after_a_404() {
     ]);
     let server = Server::start(steps);
     assert!(
-        Provider::new(&server.base)
+        Provider::new(&server.base, None)
             .unwrap()
-            .fetch(400, "Portal")
+            .fetch(400, "Portal", None)
             .unwrap()
             .is_some()
     );
@@ -372,14 +843,46 @@ fn server_failures_are_not_retried_as_endpoint_changes() {
     steps.extend([auth(), Step::post("unavailable").status(503)]);
     let server = Server::start(steps);
     assert_eq!(
-        Provider::new(&server.base)
+        Provider::new(&server.base, None)
             .unwrap()
-            .fetch(400, "Portal")
+            .fetch(400, "Portal", None)
             .unwrap_err()
             .status,
         Some(StatusCode::SERVICE_UNAVAILABLE)
     );
     assert_eq!(server.finish().len(), 4);
+}
+
+#[test]
+fn a_failed_search_does_not_prevent_a_later_lookup() {
+    let mut steps = discovery();
+    steps.extend([
+        auth(),
+        Step::post("unavailable").status(503),
+        Step::post(results(&[7230])),
+        Step::get("/game/7230", page(game())),
+    ]);
+    let server = Server::start(steps);
+    let mut provider = Provider::new(&server.base, None).unwrap();
+    assert!(provider.fetch(400, "Portal", None).is_err());
+    assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+    assert_eq!(server.finish().len(), 6);
+}
+
+#[test]
+fn a_dropped_connection_does_not_prevent_a_later_lookup() {
+    let mut steps = discovery();
+    steps.extend([
+        auth(),
+        Step::post("").status(0),
+        Step::post(results(&[7230])),
+        Step::get("/game/7230", page(game())),
+    ]);
+    let server = Server::start(steps);
+    let mut provider = Provider::new(&server.base, None).unwrap();
+    assert!(provider.fetch(400, "Portal", None).is_err());
+    assert_eq!(provider.fetch(400, "Portal", None).unwrap(), Some(data()));
+    assert_eq!(server.finish().len(), 6);
 }
 
 #[test]
@@ -392,7 +895,9 @@ fn schema_errors_empty_results_and_deadlines_are_distinct() {
         let mut steps = discovery();
         steps.extend([auth(), Step::post(response)]);
         let server = Server::start(steps);
-        let result = Provider::new(&server.base).unwrap().fetch(400, "Portal");
+        let result = Provider::new(&server.base, None)
+            .unwrap()
+            .fetch(400, "Portal", None);
         if is_error {
             assert!(result.is_err());
         } else {
@@ -400,7 +905,7 @@ fn schema_errors_empty_results_and_deadlines_are_distinct() {
         }
         server.finish();
     }
-    let provider = Provider::new(BASE).unwrap();
+    let provider = Provider::new(BASE, None).unwrap();
     assert!(
         provider
             .request("/", Instant::now() - Duration::from_secs(1))
@@ -411,17 +916,35 @@ fn schema_errors_empty_results_and_deadlines_are_distinct() {
 #[test]
 #[ignore = "requires live HowLongToBeat access"]
 fn live_steam_matches() {
-    let mut provider = Provider::new(BASE).unwrap();
+    let mut provider = Provider::new(BASE, None).unwrap();
     for (id, name) in [
         (400, "Portal"),
         (1306630, "Lost Ruins"),
         (599140, "Graveyard Keeper"),
     ] {
+        let previous_token = provider.token.clone();
         let data = provider
-            .fetch(id, name)
+            .fetch(id, name, None)
             .unwrap()
             .expect("verified HLTB match");
+        if previous_token.is_some() {
+            assert!(
+                provider.token == previous_token,
+                "{name}: token was renewed unexpectedly"
+            );
+        }
         assert!(data.main.is_some(), "{name}");
+        let mut refresh = Provider::new(BASE, None).unwrap();
+        let refreshed = refresh
+            .fetch(id, name, Some(data.game_id))
+            .unwrap()
+            .expect("direct refresh");
+        assert_eq!(refreshed.game_id, data.game_id);
+        assert!(refreshed.main.is_some());
+        assert!(
+            refresh.endpoint.is_none(),
+            "{name}: direct refresh fell back to search"
+        );
         println!(
             "{name}: {:?} / {:?} / {:?} seconds ({})",
             data.main,
@@ -438,9 +961,9 @@ fn missing_tokens_do_not_trigger_a_second_discovery_or_a_search() {
     steps.push(Step::get("/api/search/site/init?", "{}"));
     let server = Server::start(steps);
     assert!(
-        Provider::new(&server.base)
+        Provider::new(&server.base, None)
             .unwrap()
-            .fetch(400, "Portal")
+            .fetch(400, "Portal", None)
             .unwrap_err()
             .to_string()
             .contains("token missing")
@@ -463,7 +986,7 @@ fn a_slow_response_obeys_the_remaining_lookup_budget() {
         let _ = socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
     });
-    let provider = Provider::new(&base).unwrap();
+    let provider = Provider::new(&base, None).unwrap();
     let response = provider
         .request("/", Instant::now() + Duration::from_millis(30))
         .unwrap()

@@ -8,7 +8,7 @@
 use std::{
     fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -27,10 +27,17 @@ use serde_json::{Value, json};
 use crate::util::{error::STError, log::log, paths::cache_directory};
 
 const BASE: &str = "https://howlongtobeat.com";
+const WIKI_BASE: &str = "https://www.pcgamingwiki.com";
+const WIKI_USER_AGENT: &str = concat!(
+    "Aurelia-TUI/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/Drackrath/Aurelia-TUI)"
+);
 const DAY: u64 = 86_400;
 // Bump when stored data or the matching guarantees change. Old cache entries
 // then become misses instead of bypassing newer validation.
 const CACHE_VERSION: u8 = 1;
+const WIKI_CACHE_VERSION: u8 = 1;
 // Bound title-search traffic; a missing result is not an exhaustive HLTB search.
 const MAX_CANDIDATES: usize = 3;
 // Discovery downloads third-party scripts as well as JSON; bound both bodies.
@@ -43,6 +50,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 // it renders or handles input.
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PROVIDER: Mutex<Option<Provider>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 // Extract only the embedded data/route references needed by this integration;
 // scripts are never executed. LazyLock avoids recompiling these expressions on
 // every selection. Relative chunk paths stay on the provider's own host.
@@ -56,6 +65,12 @@ static ENDPOINT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PAGE_DATA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)<script\b[^>]*\bid=["']__NEXT_DATA__["'][^>]*>(.*?)</script>"#).unwrap()
+});
+static WIKI_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
+static WIKI_INFOBOX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\{\{\s*Infobox[ _]game\b").unwrap());
+static WIKI_FIELDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?mi)^\|[ \t]*(steam[ _]appid(?:[ _]side)?|hltb)[ \t]*=[ \t]*([^\r\n]*)").unwrap()
 });
 
 /// A worker owns this until completion. Drop also releases the reservation if
@@ -94,7 +109,7 @@ impl HltbData {
 }
 
 /// Per-game lookup lifecycle, shared by cloned `Game`s. Terminal results remain
-/// stable for this library load; `r` rebuilds the games and allows another try.
+/// stable for this library load; `t` retries failures and `r` rebuilds the games.
 #[derive(Debug, Clone, Default)]
 pub enum HltbState {
     /// No worker has been reserved, including while another game owns it.
@@ -155,7 +170,7 @@ fn read_cache(path: &Path, steam_id: i32) -> Option<Cached> {
     .then_some(cached)
 }
 
-fn write_cache(path: &Path, cached: &Cached) -> Result<(), STError> {
+fn write_cache(path: &Path, cached: &impl Serialize) -> Result<(), STError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -178,15 +193,23 @@ pub(crate) fn lookup(steam_id: i32, name: &str) -> HltbState {
     let path = cache_directory()
         .ok()
         .map(|p| p.join("hltb").join(format!("{steam_id}.json")));
-    lookup_cached(path.as_deref(), steam_id, now(), || {
+    lookup_cached(path.as_deref(), steam_id, now(), |game_id| {
         let mut provider = PROVIDER.lock().map_err(|e| e.to_string())?;
         if provider.is_none() {
-            *provider = Some(Provider::new(BASE)?);
+            let wiki = PcGamingWiki::new(
+                WIKI_BASE,
+                path.as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("pcgamingwiki")),
+            )
+            .map_err(|error| log!("PCGamingWiki client unavailable", error))
+            .ok();
+            *provider = Some(Provider::new(BASE, wiki)?);
         }
         provider
             .as_mut()
             .unwrap()
-            .fetch(steam_id, name)
+            .fetch(steam_id, name, game_id)
             .map_err(|e| e.to_string())
     })
 }
@@ -197,7 +220,7 @@ fn lookup_cached(
     path: Option<&Path>,
     steam_id: i32,
     timestamp: u64,
-    fetch: impl FnOnce() -> Result<Option<HltbData>, String>,
+    fetch: impl FnOnce(Option<u64>) -> Result<Option<HltbData>, String>,
 ) -> HltbState {
     let cached = path.and_then(|p| read_cache(p, steam_id));
     if let Some(c) = &cached
@@ -211,7 +234,13 @@ fn lookup_cached(
             None => HltbState::NotFound,
         };
     }
-    match fetch() {
+    // An expired positive still identifies a page worth checking first. It is
+    // only a hint: the provider must verify the Steam association again.
+    let game_id = cached
+        .as_ref()
+        .and_then(|c| c.data.as_ref())
+        .map(|d| d.game_id);
+    match fetch(game_id) {
         Ok(data) => {
             if let Some(path) = path {
                 let cached = Cached {
@@ -271,17 +300,242 @@ impl From<&str> for FetchError {
 
 type FetchResult<T> = Result<T, FetchError>;
 
+/// Page IDs are hints, never completion data. Keep this cache separate so a
+/// transient HLTB failure does not require repeating both wiki API requests.
+#[derive(Serialize, Deserialize)]
+struct WikiCached {
+    version: u8,
+    steam_id: i32,
+    fetched_at: u64,
+    game_id: Option<u64>,
+}
+
+impl WikiCached {
+    fn fresh(&self, steam_id: i32, timestamp: u64) -> bool {
+        self.version == WIKI_CACHE_VERSION
+            && self.steam_id == steam_id
+            && self.game_id.is_none_or(|id| id > 0)
+            && timestamp
+                .checked_sub(self.fetched_at)
+                .is_some_and(|age| age < if self.game_id.is_some() { 7 * DAY } else { DAY })
+    }
+}
+
+/// PCGamingWiki needs an identifying user agent and no HLTB Origin/Referer.
+/// A separate client also keeps its pacing/cooldown independent of HLTB.
+struct PcGamingWiki {
+    client: Client,
+    base: String,
+    cache: Option<PathBuf>,
+    next_request: Option<Instant>,
+    retry_after: Option<Instant>,
+}
+
+impl PcGamingWiki {
+    fn new(base: &str, cache: Option<PathBuf>) -> Result<Self, String> {
+        let client = Client::builder()
+            .user_agent(WIKI_USER_AGENT)
+            .connect_timeout(Duration::from_secs(5))
+            // The two documented API calls need no redirects. Do not let an
+            // unexpected redirect spend unpaced requests on another host.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            client,
+            base: base.into(),
+            cache,
+            next_request: None,
+            retry_after: None,
+        })
+    }
+
+    fn json(&mut self, query: &[(&str, &str)], deadline: Instant) -> FetchResult<Value> {
+        if self.retry_after.is_some_and(|t| t > Instant::now()) {
+            return Err("PCGamingWiki rate limited; wait a minute before retrying".into());
+        }
+        // PCGamingWiki documents 60 requests/minute. This worker is serialized;
+        // spacing request starts also prevents bursts across different games.
+        if let Some(next) = self.next_request {
+            let wait = next.saturating_duration_since(Instant::now());
+            if wait >= deadline.saturating_duration_since(Instant::now()) {
+                return Err("PCGamingWiki lookup timed out while waiting to request".into());
+            }
+            std::thread::sleep(wait);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("PCGamingWiki lookup timed out")?;
+        self.next_request = Some(Instant::now() + Duration::from_secs(1));
+        let response = self
+            .client
+            .get(format!("{}/w/api.php", self.base))
+            .query(query)
+            .timeout(remaining.min(Duration::from_secs(8)))
+            .send();
+        let body = match Provider::body(response, "PCGamingWiki API request") {
+            Err(e) if e.status == Some(StatusCode::TOO_MANY_REQUESTS) => {
+                self.retry_after = Some(Instant::now() + Duration::from_secs(60));
+                return Err(e);
+            }
+            result => result?,
+        };
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| format!("PCGamingWiki API response: {e}"))?;
+        // MediaWiki may report failures (including ratelimited) with HTTP 200.
+        if let Some(error) = value.get("error") {
+            if error["code"].as_str() == Some("ratelimited") {
+                self.retry_after = Some(Instant::now() + Duration::from_secs(60));
+            }
+            return Err(format!("PCGamingWiki API error: {error}").into());
+        }
+        Ok(value)
+    }
+
+    fn lookup(&mut self, steam_id: i32, deadline: Instant) -> FetchResult<Option<u64>> {
+        let path = self
+            .cache
+            .as_ref()
+            .map(|p| p.join(format!("{steam_id}.json")));
+        if let Some(cached) = path
+            .as_ref()
+            .and_then(|p| fs::read(p).ok())
+            .and_then(|bytes| serde_json::from_slice::<WikiCached>(&bytes).ok())
+            && cached.fresh(steam_id, now())
+        {
+            return Ok(cached.game_id);
+        }
+        let result = self.lookup_inner(steam_id, deadline)?;
+        // Cache only successful mappings/misses; HTTP/schema errors stay retryable.
+        if let Some(path) = path {
+            let cached = WikiCached {
+                version: WIKI_CACHE_VERSION,
+                steam_id,
+                fetched_at: now(),
+                game_id: result,
+            };
+            if let Err(error) = write_cache(&path, &cached) {
+                log!("PCGamingWiki cache write failed", steam_id, error);
+            }
+        }
+        Ok(result)
+    }
+
+    fn lookup_inner(&mut self, steam_id: i32, deadline: Instant) -> FetchResult<Option<u64>> {
+        let id = steam_id.to_string();
+        let lookup = self.json(
+            &[
+                ("action", "idlookup"),
+                ("field", "steamappid"),
+                ("value", &id),
+                ("format", "json"),
+            ],
+            deadline,
+        )?;
+        let pages = lookup["idlookup"]
+            .as_array()
+            .ok_or("PCGamingWiki lookup pages missing")?;
+        if pages.is_empty() {
+            return Ok(None);
+        }
+        // Do not arbitrarily select a page when an app ID has multiple matches.
+        if pages.len() != 1 {
+            return Err("PCGamingWiki Steam app ID maps to multiple pages".into());
+        }
+        let title = pages[0]
+            .pointer("/title/Page")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("PCGamingWiki page title missing")?;
+        let page = self.json(
+            &[
+                ("action", "parse"),
+                ("page", title),
+                ("prop", "wikitext"),
+                ("redirects", "1"),
+                ("format", "json"),
+            ],
+            deadline,
+        )?;
+        let text = page
+            .pointer("/parse/wikitext/*")
+            .and_then(Value::as_str)
+            .ok_or("PCGamingWiki page data missing")?;
+        wiki_game_id(text, steam_id).map_err(FetchError::from)
+    }
+}
+
+/// Read only the game infobox, ignoring commented-out IDs and unrelated text.
+/// The mapping is checked against the page's Steam IDs and then against HLTB.
+fn wiki_game_id(text: &str, steam_id: i32) -> Result<Option<u64>, String> {
+    let text = WIKI_COMMENTS.replace_all(text, "");
+    let start = WIKI_INFOBOX
+        .find(&text)
+        .ok_or("PCGamingWiki game infobox missing")?;
+    let bytes = text.as_bytes();
+    let (mut pos, mut depth) = (start.start(), 0usize);
+    let end = loop {
+        match bytes.get(pos..pos + 2) {
+            Some(b"{{") => {
+                depth += 1;
+                pos += 2;
+            }
+            Some(b"}}") => {
+                depth -= 1;
+                if depth == 0 {
+                    break pos;
+                }
+                pos += 2;
+            }
+            Some(_) => pos += 1,
+            None => return Err("PCGamingWiki game infobox incomplete".into()),
+        }
+    };
+    let mut fields = std::collections::HashMap::new();
+    for field in WIKI_FIELDS.captures_iter(&text[start.end()..end]) {
+        let key = field[1].to_ascii_lowercase().replace('_', " ");
+        if fields.insert(key, field[2].trim().to_owned()).is_some() {
+            return Err("PCGamingWiki duplicate game identity field".into());
+        }
+    }
+    let expected = u64::try_from(steam_id).map_err(|_| "Invalid Steam app ID")?;
+    if !["steam appid", "steam appid side"].iter().any(|key| {
+        fields.get(*key).is_some_and(|ids| {
+            ids.split(',')
+                .any(|id| id.trim().parse::<u64>().ok() == Some(expected))
+        })
+    }) {
+        return Err("PCGamingWiki page did not confirm the Steam app ID".into());
+    }
+    match fields
+        .get("hltb")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        None => Ok(None),
+        Some(id) => id
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .map(Some)
+            .ok_or_else(|| "PCGamingWiki HLTB ID invalid".into()),
+    }
+}
+
 /// Website-session state shared across selections. The base URL is injectable
 /// for local HTTP tests; production always uses the fixed HLTB origin above.
 struct Provider {
     client: Client,
     base: String,
     endpoint: Option<String>,
+    // Reuse only in this process; rejected tokens are renewed before discovery.
+    token: Option<String>,
     retry_after: Option<Instant>,
+    wiki: Option<PcGamingWiki>,
 }
 
 impl Provider {
-    fn new(base: &str) -> Result<Self, String> {
+    fn new(base: &str, wiki: Option<PcGamingWiki>) -> Result<Self, String> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -303,7 +557,9 @@ impl Provider {
             client,
             base: base.into(),
             endpoint: None,
+            token: None,
             retry_after: None,
+            wiki,
         })
     }
 
@@ -381,21 +637,24 @@ impl Provider {
 
     /// Mirror the public search form. Its short-lived website token is unrelated
     /// to Steam authentication and must never be stored in the game cache.
-    fn search(&self, endpoint: &str, name: &str, deadline: Instant) -> FetchResult<Value> {
-        // A fresh cache-busting timestamp prevents reusing an expired init
-        // response when the search route is retried after a deployment.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let auth = self.text(&format!("{endpoint}/init?t={nonce}"), deadline)?;
-        let auth: Value =
-            serde_json::from_str(&auth).map_err(|e| format!("HLTB search token response: {e}"))?;
-        let token = auth
-            .get("token")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .ok_or("HLTB search token missing")?;
+    fn search(&mut self, endpoint: &str, name: &str, deadline: Instant) -> FetchResult<Value> {
+        if self.token.is_none() {
+            // A fresh cache-busting timestamp prevents reusing an expired init
+            // response when the search route is retried after a deployment.
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let auth = self.text(&format!("{endpoint}/init?t={nonce}"), deadline)?;
+            let auth: Value = serde_json::from_str(&auth)
+                .map_err(|e| format!("HLTB search token response: {e}"))?;
+            let token = auth
+                .get("token")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .ok_or("HLTB search token missing")?;
+            self.token = Some(token.into());
+        }
         let payload = json!({
             "searchType": "games", "searchTerms": name.split_whitespace().collect::<Vec<_>>(),
             "searchPage": 1, "size": 20, "useCache": true,
@@ -414,7 +673,7 @@ impl Provider {
         let response = self
             .client
             .post(format!("{}{endpoint}", self.base))
-            .header("x-auth-token", token)
+            .header("x-auth-token", self.token.as_deref().unwrap())
             .timeout(remaining.min(Duration::from_secs(8)))
             .json(&payload)
             .send();
@@ -424,14 +683,24 @@ impl Provider {
 
     /// One selected-game lookup. Rate limiting belongs to the shared provider
     /// so moving to a different game cannot immediately bypass the cooldown.
-    fn fetch(&mut self, steam_id: i32, name: &str) -> FetchResult<Option<HltbData>> {
+    fn fetch(
+        &mut self,
+        steam_id: i32,
+        name: &str,
+        game_id: Option<u64>,
+    ) -> FetchResult<Option<HltbData>> {
         if steam_id <= 0 || name.trim().is_empty() {
             return Err("Invalid Steam game identity".into());
         }
         if self.retry_after.is_some_and(|t| t > Instant::now()) {
             return Err("HLTB rate limited; wait a minute before retrying".into());
         }
-        let result = self.fetch_inner(steam_id, name, Instant::now() + Duration::from_secs(30));
+        let result = self.fetch_inner(
+            steam_id,
+            name,
+            game_id,
+            Instant::now() + Duration::from_secs(30),
+        );
         if result
             .as_ref()
             .err()
@@ -446,12 +715,83 @@ impl Provider {
         &mut self,
         steam_id: i32,
         name: &str,
+        game_id: Option<u64>,
+        deadline: Instant,
+    ) -> FetchResult<Option<HltbData>> {
+        if let Some(id) = game_id {
+            // Refresh a known page without search discovery or authentication.
+            // A removed page/association can still be recovered by title search;
+            // transport/schema failures retain stale data without extra traffic.
+            match self.text(&format!("/game/{id}"), deadline) {
+                Ok(html) => {
+                    if let Some(data) = verified_game(&html, steam_id, id)? {
+                        return Ok(Some(data));
+                    }
+                }
+                Err(e) if e.status == Some(StatusCode::NOT_FOUND) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut wiki_error = None;
+        if let Some(wiki) = self.wiki.as_mut() {
+            match wiki.lookup(steam_id, deadline) {
+                Ok(Some(id)) if Some(id) != game_id => {
+                    match self.text(&format!("/game/{id}"), deadline) {
+                        Ok(html) => {
+                            if let Some(data) = verified_game(&html, steam_id, id)? {
+                                return Ok(Some(data));
+                            }
+                        }
+                        Err(e) if e.status == Some(StatusCode::NOT_FOUND) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log!(
+                        "PCGamingWiki lookup failed; falling back to HLTB search",
+                        steam_id,
+                        error
+                    );
+                    wiki_error = Some(error);
+                }
+            }
+        }
+        let result = self.search_game(steam_id, name, deadline);
+        // A source outage is not a cacheable missing game. A verified fallback
+        // is still usable, but a search miss must retain the original failure.
+        match (result, wiki_error) {
+            (Ok(None), Some(error)) => Err(error.to_string().into()),
+            (result, _) => result,
+        }
+    }
+
+    fn search_game(
+        &mut self,
+        steam_id: i32,
+        name: &str,
         deadline: Instant,
     ) -> FetchResult<Option<HltbData>> {
         if self.endpoint.is_none() {
             self.endpoint = Some(self.discover(deadline)?);
         }
-        let response = match self.search(self.endpoint.as_deref().unwrap(), name, deadline) {
+        let endpoint = self.endpoint.clone().unwrap();
+        let reused_token = self.token.is_some();
+        let mut search = self.search(&endpoint, name, deadline);
+        if reused_token
+            && search.as_ref().err().is_some_and(|e| {
+                matches!(
+                    e.status,
+                    Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                )
+            })
+        {
+            // An expired token does not imply a changed route. Renew it once
+            // before downloading the homepage and scripts again.
+            self.token = None;
+            search = self.search(&endpoint, name, deadline);
+        }
+        let response = match search {
             Ok(response) => response,
             // These statuses may indicate an expired token or changed route.
             // Rediscover once within the original deadline; 429/5xx must not
@@ -463,8 +803,10 @@ impl Provider {
                 ) =>
             {
                 self.endpoint = None;
+                self.token = None;
                 self.endpoint = Some(self.discover(deadline)?);
-                self.search(self.endpoint.as_deref().unwrap(), name, deadline)?
+                let endpoint = self.endpoint.clone().unwrap();
+                self.search(&endpoint, name, deadline)?
             }
             Err(e) => return Err(e),
         };
